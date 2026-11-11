@@ -4,20 +4,17 @@ services:
     container_name: youtube-scanner
     restart: unless-stopped
     init: true
-    depends_on:
-      mongo:
-        condition: service_healthy
+    env_file:
+      - .env
     environment:
-      PORT: 3000
-      MONGODB_URI: ${MONGODB_URI_DOCKER:-mongodb://mongo:27017/youtube_scanner}
+      PORT: ${PORT:-3000}
+      MONGODB_URI: ${MONGODB_URI:?Set MONGODB_URI in the project .env file}
       YT_DLP_PATH: /opt/yt-dlp/bin/yt-dlp
-      VIDEOS_PER_SOURCE: ${VIDEOS_PER_SOURCE:-50}
-      MAX_RETRIES: ${MAX_RETRIES:-3}
-      REQUIRE_MANUAL_APPROVAL: ${REQUIRE_MANUAL_APPROVAL:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-debug}
     ports:
-      - "${PORT:-3000}:3000"
+      - "${PORT:-3000}:${PORT:-3000}"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -30,27 +27,3 @@ services:
       options:
         max-size: 10m
         max-file: "3"
-
-  mongo:
-    image: mongo:7
-    container_name: youtube-scanner-mongo
-    restart: unless-stopped
-    command: ["mongod", "--bind_ip_all"]
-    volumes:
-      - mongo_data:/data/db
-    healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
-    mem_limit: 1g
-    mem_reservation: 256m
-    logging:
-      driver: json-file
-      options:
-        max-size: 10m
-        max-file: "3"
-
-volumes:
-  mongo_data:

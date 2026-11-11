@@ -5,7 +5,19 @@ const mongoose = require('mongoose');
 const { connectDB } = require('./db');
 const { Source, QueuedVideo, ScanHistory } = require('./models');
 const scanner = require('./scanner');
+const logger = require('./logger');
 const app = express();
+app.use((req, res, next) => {
+  const started = Date.now();
+  res.on('finish', () => {
+    const details = { method: req.method, path: req.path, status: res.statusCode, durationMs: Date.now() - started, clientIp: req.ip };
+    if (req.path === '/api/health') logger.debug('http_request_completed', details);
+    else if (res.statusCode >= 500) logger.error('http_request_failed', details);
+    else if (res.statusCode >= 400) logger.warn('http_request_rejected', details);
+    else logger.info('http_request_completed', details);
+  });
+  next();
+});
 app.use(express.json({ limit: '256kb' }));
 app.use(express.static('public'));
 const priorities = ['HIGH', 'NORMAL', 'LOW'];
@@ -66,7 +78,19 @@ app.post('/api/scan/:sourceId', async (req, res, next) => { try { objectId(req.p
 app.get('/api/scan-history', async (req, res, next) => { try { const page = Math.max(1, Number.parseInt(req.query.page || '1', 10) || 1); const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit || '50', 10) || 50)); const [items, total] = await Promise.all([ScanHistory.find().sort({ startedAt: -1 }).skip((page - 1) * limit).limit(limit).lean(), ScanHistory.countDocuments()]); res.json({ items, total, page, limit }); } catch (e) { next(e); } });
 app.get('/api/scan-history/:sourceId', async (req, res, next) => { try { objectId(req.params.sourceId); res.json(await ScanHistory.find({ sourceId: req.params.sourceId }).sort({ startedAt: -1 }).limit(100).lean()); } catch (e) { next(e); } });
 app.get('/api/stats', async (_req, res, next) => { try { const [sources, queue] = await Promise.all([Source.countDocuments(), QueuedVideo.aggregate([{ $group: { _id: null, total: { $sum: 1 }, pendingApproval: { $sum: { $cond: [{ $eq: ['$approvalStatus', 'PENDING'] }, 1, 0] } }, approved: { $sum: { $cond: [{ $eq: ['$approvalStatus', 'APPROVED'] }, 1, 0] } }, pendingImports: { $sum: { $cond: [{ $and: [{ $eq: ['$status', 'PENDING'] }, { $eq: ['$approvalStatus', 'APPROVED'] }] }, 1, 0] } }, processed: { $sum: { $cond: [{ $eq: ['$status', 'PROCESSED'] }, 1, 0] } }, failed: { $sum: { $cond: [{ $eq: ['$status', 'FAILED'] }, 1, 0] } } } }])]); res.json({ sources, ...(queue[0] || { total: 0, pendingApproval: 0, approved: 0, pendingImports: 0, processed: 0, failed: 0 }) }); } catch (e) { next(e); } });
-app.use((err, _req, res, _next) => { console.error('[api]', err.message); if (err.code === 11000) return res.status(409).json({ error: 'A source with this URL already exists' }); res.status(err.status || 500).json({ error: err.status ? err.message : 'Internal server error' }); });
-async function start() { await connectDB(); await Promise.all([Source.init(), QueuedVideo.init(), ScanHistory.init()]); const port = Number(process.env.PORT || 3000); app.listen(port, '0.0.0.0', () => console.log(`[server] listening on ${port}; restrict access to trusted LAN`)); }
-if (require.main === module) start().catch(err => { console.error('[server] startup failed:', err.message); process.exit(1); });
+app.use((err, _req, res, _next) => {
+  logger.error('http_request_exception', { message: err.message, stack: err.stack });
+  if (err.code === 11000) return res.status(409).json({ error: 'A source with this URL already exists' });
+  res.status(err.status || 500).json({ error: err.status ? err.message : 'Internal server error' });
+});
+async function start() {
+  logger.info('server_starting', { port: Number(process.env.PORT || 3000), logLevel: process.env.LOG_LEVEL || 'info' });
+  await connectDB();
+  logger.info('mongodb_connected');
+  await Promise.all([Source.init(), QueuedVideo.init(), ScanHistory.init()]);
+  logger.info('mongodb_indexes_ready', { collections: ['sources', 'youtube_queue', 'scan_history'] });
+  const port = Number(process.env.PORT || 3000);
+  app.listen(port, '0.0.0.0', () => logger.info('server_listening', { port, trustedLanOnly: true }));
+}
+if (require.main === module) start().catch(err => { logger.error('server_startup_failed', { message: err.message, stack: err.stack }); process.exit(1); });
 module.exports = app;

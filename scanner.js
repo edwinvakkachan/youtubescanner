@@ -3,6 +3,7 @@ require('dotenv').config();
 const { spawn } = require('node:child_process');
 const { connectDB } = require('./db');
 const { Source, QueuedVideo, ScanHistory } = require('./models');
+const logger = require('./logger');
 
 const LIMIT = Math.max(1, Number.parseInt(process.env.VIDEOS_PER_SOURCE || '50', 10) || 50);
 const MAX_RETRIES = Math.max(1, Number.parseInt(process.env.MAX_RETRIES || '3', 10) || 3);
@@ -24,6 +25,7 @@ function runYtDlp(url) {
       clearTimeout(timeout);
       if (settled) return;
       settled = true;
+      if (code !== 0 && stdout.trim()) logger.warn('ytdlp_partial_exit', { exitCode: code, stderr: stderr.trim().slice(0, 2000) });
       if (code !== 0 && !stdout.trim()) return reject(new Error((stderr.trim() || `yt-dlp exited ${code}`).slice(0, 2000)));
       try {
         const lines = stdout.split(/\r?\n/).filter(line => line.trim());
@@ -82,25 +84,39 @@ async function scanSource(source) {
   if (activeSources.has(sourceKey)) return { skipped: true, reason: 'source scan already running' };
   const lockUntil = new Date(Date.now() + 6 * 60 * 1000);
   const lock = await Source.findOneAndUpdate({ _id: source._id, $or: [{ scanLockUntil: null }, { scanLockUntil: { $lt: new Date() } }] }, { $set: { scanLockUntil: lockUntil } }, { new: true, select: '+scanLockUntil' });
-  if (!lock) return { sourceId: sourceKey, skipped: true, reason: 'source scan already running' };
+  if (!lock) {
+    logger.warn('source_scan_skipped_locked', { sourceId: sourceKey, sourceName: source.name });
+    return { sourceId: sourceKey, skipped: true, reason: 'source scan already running' };
+  }
   activeSources.add(sourceKey);
   const startedAt = new Date();
   const history = await ScanHistory.create({ sourceId: source._id, sourceName: source.name, sourceType: source.type, startedAt });
   let inspected = 0, matched = 0, rejected = 0; const errors = [];
+  logger.info('source_scan_started', { sourceId: sourceKey, sourceName: source.name, sourceType: source.type, maxEntries: LIMIT });
   try {
     const entries = await runYtDlp(source.url);
     for (const entry of entries.slice(0, LIMIT)) {
       const id = videoId(entry); if (!id) continue;
       inspected++;
       const result = findMatches(source, entry);
-      if (!result.accepted) { rejected++; continue; }
-      try { await upsertVideo(source, entry, result.matches); matched++; }
-      catch (err) { errors.push(`${id}: ${err.message}`); }
+      if (!result.accepted) {
+        rejected++;
+        logger.debug('video_rejected_by_keywords', { sourceId: sourceKey, youtubeId: id });
+        continue;
+      }
+      try {
+        await upsertVideo(source, entry, result.matches);
+        matched++;
+        logger.debug('video_queued_or_refreshed', { sourceId: sourceKey, youtubeId: id, matchedKeywords: result.matches });
+      } catch (err) {
+        errors.push(`${id}: ${err.message}`);
+        logger.error('video_queue_update_failed', { sourceId: sourceKey, youtubeId: id, message: err.message });
+      }
     }
     const completedAt = new Date();
     await Source.updateOne({ _id: source._id }, { $set: { lastScannedAt: completedAt } });
     await ScanHistory.updateOne({ _id: history._id }, { $set: { completedAt, inspected, matched, rejected, errorCount: errors.length, errorDetails: errors, status: errors.length ? (inspected ? 'PARTIAL' : 'FAILED') : 'COMPLETED' } });
-    console.log(`[scanner] ${source.name}: inspected=${inspected} matched=${matched} rejected=${rejected} errors=${errors.length}`);
+    logger.info('source_scan_completed', { sourceId: sourceKey, sourceName: source.name, status: errors.length ? (inspected ? 'PARTIAL' : 'FAILED') : 'COMPLETED', inspected, matched, rejected, errors: errors.length, durationMs: completedAt.getTime() - startedAt.getTime() });
     return { sourceId: sourceKey, inspected, matched, rejected, errors: errors.length };
   } catch (err) {
     errors.push(err.message);
@@ -108,7 +124,7 @@ async function scanSource(source) {
     await Source.updateOne({ _id: source._id }, { $set: { lastScannedAt: completedAt } }).catch(() => {});
     await ScanHistory.updateOne({ _id: history._id }, { $set: { completedAt, inspected, matched, rejected, errorCount: errors.length, errorDetails: errors, status: 'FAILED' } });
     const message = err.code === 'ENOENT' ? `yt-dlp executable not found. Install yt-dlp and ensure it is on PATH, or set YT_DLP_PATH to its executable. (${process.env.YT_DLP_PATH || 'yt-dlp'})` : err.message;
-    console.error(`[scanner] ${source.name} failed: ${message}`);
+    logger.error('source_scan_failed', { sourceId: sourceKey, sourceName: source.name, inspected, matched, rejected, message: err.message, hint: message, durationMs: completedAt.getTime() - startedAt.getTime() });
     return { sourceId: sourceKey, inspected, matched, rejected, errors: errors.length, error: message };
   } finally {
     activeSources.delete(sourceKey);
@@ -120,8 +136,10 @@ async function scanAll() {
   activeAll = true;
   try {
     const sources = await Source.find({ enabled: true }).sort({ createdAt: 1 }).lean();
+    logger.info('full_scan_started', { enabledSources: sources.length, maxEntriesPerSource: LIMIT });
     const results = [];
     for (const source of sources) results.push(await scanSource(source));
+    logger.info('full_scan_completed', { sourceCount: results.length, scanned: results.filter(item => !item.skipped).length, skipped: results.filter(item => item.skipped).length });
     return results;
   } finally { activeAll = false; }
 }
@@ -135,6 +153,10 @@ module.exports = { scanAll, scanOne, runYtDlp, findMatches, LIMIT };
 if (require.main === module) {
   require('dotenv').config();
   const { connectDB } = require('./db');
-  connectDB().then(async () => { const result = await scanAll(); console.log(`[scanner] completed ${result.length} source scans`); await require('mongoose').disconnect(); })
-    .catch(err => { console.error(`[scanner] fatal: ${err.message}`); process.exitCode = 1; });
+  connectDB().then(async () => {
+    logger.info('scanner_process_started', { mongodb: 'connected' });
+    const result = await scanAll();
+    logger.info('scanner_process_finished', { sourceCount: result.length });
+    await require('mongoose').disconnect();
+  }).catch(err => { logger.error('scanner_process_failed', { message: err.message, stack: err.stack }); process.exitCode = 1; });
 }
