@@ -117,16 +117,18 @@ Collections are `sources`, `youtube_queue`, and `scan_history`. Mongoose creates
 
 ## Run with Docker Compose
 
-Docker Compose starts the web app and MongoDB 7, persists database files in the `mongo_data` volume, and installs yt-dlp inside the app image.
+Docker Compose starts only the scanner app. It installs yt-dlp inside the app image and reads the online MongoDB connection string from `MONGODB_URI` in the project `.env` file. It does not install or start MongoDB.
 
 ```sh
-docker compose up -d --build
+docker compose up -d --build --remove-orphans
 docker compose ps
 docker compose logs -f app
 ```
 
-Open `http://localhost:3000`. Run a one-off scan with `docker compose exec app npm run scan`. Stop the services with `docker compose down`; this preserves the database volume. To also delete queued videos and all MongoDB data, run `docker compose down -v`.
+Open `http://localhost:3000`. Run a one-off scan with `docker compose exec app npm run scan`. Stop the app with `docker compose down`; data remains in the online MongoDB instance.
 
-Compose uses `MONGODB_URI_DOCKER` for an optional external MongoDB URI, so a local `.env` setting of `MONGODB_URI=mongodb://127.0.0.1:27017/...` will not point the container back to itself. Leave `MONGODB_URI_DOCKER` unset to use the bundled MongoDB. For MongoDB on the Docker Desktop host, set `MONGODB_URI_DOCKER=mongodb://host.docker.internal:27017/youtube_scanner`. Set `PORT` to change the host port, for example `PORT=8080` publishes port 8080 while the app listens on 3000 inside Docker.
+Set `MONGODB_URI` in `.env` to your provider's full connection string. The Compose file passes that value directly to the app and fails configuration if it is missing. Set `PORT` to change the published and container app port.
+
+Application logs are structured JSON with ISO timestamps and are written to stdout/stderr, so they are visible with `docker compose logs -f --tail 200 app`. The default Docker `LOG_LEVEL=debug` includes per-video match/rejection records, scan counts and duration, API request status, startup/index status, and errors. Set `LOG_LEVEL=info` in `.env` to reduce per-video detail. Docker retains rotated logs using the configured `json-file` logging driver (three 10 MB files).
 
 The Docker dashboard has no authentication; restrict the published port to a trusted LAN.
