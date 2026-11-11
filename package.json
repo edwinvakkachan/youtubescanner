@@ -1,0 +1,19 @@
+{
+  "name": "youtube-channel-playlist-shorts-scanner",
+  "version": "1.0.0",
+  "description": "Metadata-only YouTube discovery queue with an Express dashboard",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "scan": "node scanner.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "mongoose": "^8.9.5"
+  }
+}
