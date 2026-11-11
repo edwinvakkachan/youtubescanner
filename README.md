@@ -17,7 +17,7 @@ Open `http://localhost:3000`. The server listens on `0.0.0.0` for LAN access. Th
 
 Run discovery independently with `npm run scan`; this scans every enabled source and exits. Cron or a systemd timer can invoke `node /path/to/youtubeascanner/scanner.js`. Per-source MongoDB leases prevent overlapping scans across server/scanner processes; the lease expires after six minutes if a process exits unexpectedly.
 
-`VIDEOS_PER_SOURCE` controls the maximum entries scanned per source (default 50). `REQUIRE_MANUAL_APPROVAL=true` puts new discoveries in pending approval; when false, new videos are approved automatically. Existing approval decisions are kept. `MAX_RETRIES` sets the initial retry ceiling for new queue records.
+`VIDEOS_PER_SOURCE` controls the default number of entries scanned per source (default 50). Each channel, playlist, or Shorts source can override this with its own `videosPerScan` setting (1–10000). `REQUIRE_MANUAL_APPROVAL=true` puts new discoveries in pending approval; when false, new videos are approved automatically. Existing approval decisions are kept. `MAX_RETRIES` sets the initial retry ceiling for new queue records.
 
 The server automatically scans enabled sources every 360 minutes by default. Change the interval or pause/resume automatic scans from the Overview dashboard; settings are stored in MongoDB and survive container restarts. The interval can be set from 1 to 10080 minutes. `npm run scan` remains a one-shot scan.
 
@@ -25,6 +25,7 @@ The server automatically scans enabled sources every 360 minutes by default. Cha
 
 - `yt-dlp --dump-json --playlist-end N --ignore-errors --no-warnings --skip-download` retrieves metadata only. The scanner stores title, description, thumbnail, upload date, duration, and YouTube ID.
 - Include/exclude keywords are case-insensitive and search title plus description. Exclusions take precedence. Empty include rules accept any non-excluded video. ANY means at least one include term; ALL means every include term.
+- Each source can disable description matching to search titles only. With `generateNfo` enabled, the scanner writes a Kodi-style XML NFO for every inspected video, reads it back, and matches configured keywords against its `<plot>` description. NFO files contain metadata only; no video files are downloaded.
 - A unique index on `youtubeId` prevents duplicate queue records. Rediscovery adds the source contribution and matched terms, while `$setOnInsert` preserves approval, import status, retries, and original discovery time.
 - Queue priority is the highest priority among discovery sources: HIGH, then NORMAL, then LOW. `priorityRank` (1/2/3) is stored and importer queries should sort by it, then oldest `discoveredAt`.
 - Source deletion does not remove queue records or scan history.
@@ -32,7 +33,7 @@ The server automatically scans enabled sources every 360 minutes by default. Cha
 
 ## API
 
-Sources: `GET/POST /api/sources`, `PUT/DELETE /api/sources/:id`. A source POST accepts `name`, `url`, `type` (`channel`, `playlist`, `shorts`), `keywords`, `excludeKeywords`, `matchMode` (`ANY`/`ALL`), `priority` (`HIGH`/`NORMAL`/`LOW`), `enabled`, and channel-only `autoApproveVideos`. When enabled, matching videos from that channel are approved automatically and bypass the manual approval step.
+Sources: `GET/POST /api/sources`, `PUT/DELETE /api/sources/:id`. A source POST accepts `name`, `url`, `type` (`channel`, `playlist`, `shorts`), `videosPerScan` (1–10000), `scanDescription`, `generateNfo`, `keywords`, `excludeKeywords`, `matchMode` (`ANY`/`ALL`), `priority` (`HIGH`/`NORMAL`/`LOW`), `enabled`, and channel-only `autoApproveVideos`. When enabled, matching videos from that channel are approved automatically and bypass the manual approval step.
 
 Queue: `GET /api/queue` accepts `status`, `approvalStatus`, `priority`, `q`, `page`, and `limit` (maximum 100). Approval: `POST /api/queue/:id/approve`, `/reject`, and `/api/queue/bulk-approve` with `{ "ids": ["..."] }`. Retry: `POST /api/queue/:id/retry` or `/api/queue/bulk-retry` for eligible failures. `POST /api/queue/:id/reset` manually resets a non-rejected failed record and its retry counter. Scanning: `POST /api/scan`, `POST /api/scan/:sourceId`. History: `GET /api/scan-history` and `/api/scan-history/:sourceId`. Scan scheduling: `GET/PUT /api/settings/scan` (`autoScanEnabled`, `scanIntervalMinutes`, valid range 1–10080). Statistics: `GET /api/stats`. All API responses are JSON.
 
@@ -46,6 +47,9 @@ Queue: `GET /api/queue` accepts `status`, `approvalStatus`, `priority`, `q`, `pa
   "name": "Space news",
   "url": "https://www.youtube.com/@example/videos",
   "type": "channel",
+  "videosPerScan": 50,
+  "scanDescription": true,
+  "generateNfo": false,
   "keywords": ["astronomy", "spaceflight"],
   "excludeKeywords": ["reaction"],
   "matchMode": "ANY",
@@ -129,7 +133,9 @@ docker compose logs -f app
 
 Open `http://localhost:3000`. Run a one-off scan with `docker compose exec app npm run scan`. Stop the app with `docker compose down`; data remains in the online MongoDB instance.
 
-For local Compose, set `MONGODB_URI` in `.env` to your provider's full connection string; Compose automatically reads `.env` for variable substitution. In Portainer, add `MONGODB_URI` and any optional settings such as `PORT`, `VIDEOS_PER_SOURCE`, `MAX_RETRIES`, `REQUIRE_MANUAL_APPROVAL`, and `LOG_LEVEL` in the stack environment variables or uploaded environment file. Deployment fails clearly if `MONGODB_URI` is missing. Set `PORT` to change the published and container app port.
+For local Compose, set `MONGODB_URI` in `.env` to your provider's full connection string; Compose automatically reads `.env` for variable substitution. In Portainer, add `MONGODB_URI`, `NFO_HOST_PATH`, and any optional settings such as `PORT`, `VIDEOS_PER_SOURCE`, `MAX_RETRIES`, `REQUIRE_MANUAL_APPROVAL`, and `LOG_LEVEL` in the stack environment variables or uploaded environment file. Deployment fails clearly if `MONGODB_URI` is missing. Set `PORT` to change the published and container app port.
+
+In Portainer, set `NFO_HOST_PATH` to a writable directory on the Docker host. Compose mounts it at `/nfo` inside the app; create the host directory or allow Docker to create it, and grant write access to the container's `node` user (UID 1000). Generated files are stored under `/nfo/<source-id>/<youtube-id>.nfo`. Set the per-source **Generate NFO and scan its description** option to enable NFO generation and NFO-based description matching.
 
 Application logs are structured JSON with ISO timestamps and are written to stdout/stderr, so they are visible with `docker compose logs -f --tail 200 app`. The default Docker `LOG_LEVEL=debug` includes per-video match/rejection records, scan counts and duration, API request status, startup/index status, and errors. Set `LOG_LEVEL=info` in `.env` to reduce per-video detail. Docker retains rotated logs using the configured `json-file` logging driver (three 10 MB files).
 

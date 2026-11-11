@@ -1,11 +1,15 @@
 'use strict';
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
+const defaultVideosPerScan = Math.min(10000, Math.max(1, Number.parseInt(process.env.VIDEOS_PER_SOURCE || '50', 10) || 50));
 
 const sourceSchema = new Schema({
   name: { type: String, required: true, trim: true, maxlength: 160 },
   url: { type: String, required: true, trim: true },
   type: { type: String, required: true, enum: ['channel', 'playlist', 'shorts'] },
+  videosPerScan: { type: Number, default: defaultVideosPerScan, min: 1, max: 10000 },
+  scanDescription: { type: Boolean, default: true },
+  generateNfo: { type: Boolean, default: false },
   keywords: { type: [String], default: [] },
   excludeKeywords: { type: [String], default: [] },
   matchMode: { type: String, enum: ['ANY', 'ALL'], default: 'ANY' },

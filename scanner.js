@@ -2,25 +2,27 @@
 require('dotenv').config();
 const { spawn } = require('node:child_process');
 const readline = require('node:readline');
+const fs = require('node:fs/promises');
+const path = require('node:path');
 const { connectDB } = require('./db');
 const { Source, QueuedVideo, ScanHistory } = require('./models');
 const logger = require('./logger');
 
-const LIMIT = Math.max(1, Number.parseInt(process.env.VIDEOS_PER_SOURCE || '50', 10) || 50);
+const LIMIT = Math.min(10000, Math.max(1, Number.parseInt(process.env.VIDEOS_PER_SOURCE || '50', 10) || 50));
 const MAX_RETRIES = Math.max(1, Number.parseInt(process.env.MAX_RETRIES || '3', 10) || 3);
 const PRIORITY_RANK = { HIGH: 1, NORMAL: 2, LOW: 3 };
 let activeAll = false;
 const activeSources = new Set();
 
-function runYtDlp(source) {
+function runYtDlp(source, limit) {
   return new Promise((resolve, reject) => {
     const executable = process.env.YT_DLP_PATH || 'yt-dlp';
-    const args = ['--dump-json', '--playlist-end', String(LIMIT), '--ignore-errors', '--no-warnings', '--skip-download', source.url];
+    const args = ['--dump-json', '--playlist-end', String(limit), '--ignore-errors', '--no-warnings', '--skip-download', source.url];
     const child = spawn(executable, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     const entries = [];
     let stderr = ''; let settled = false; let parseErrors = 0;
     const timeout = setTimeout(() => { child.kill(); if (!settled) { settled = true; clearInterval(heartbeat); reject(new Error('yt-dlp timed out after 5 minutes')); } }, 300000);
-    const heartbeat = setInterval(() => logger.info('ytdlp_process_still_running', { sourceId: String(source._id), sourceName: source.name, elapsedSeconds: Math.floor((Date.now() - startedAt) / 1000), metadataEntriesReceived: entries.length }), 30000);
+    const heartbeat = setInterval(() => logger.info('ytdlp_process_still_running', { sourceId: String(source._id), sourceName: source.name, elapsedSeconds: Math.floor((Date.now() - startedAt) / 1000), metadataEntriesReceived: entries.length, targetEntries: limit }), 30000);
     const startedAt = Date.now();
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     const outputLines = readline.createInterface({ input: child.stdout });
@@ -36,7 +38,7 @@ function runYtDlp(source) {
       }
     });
     child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-4000); });
-    child.on('spawn', () => logger.info('ytdlp_process_started', { sourceId: String(source._id), sourceName: source.name, executable, maxEntries: LIMIT, metadataOnly: true, videoDownload: false }));
+    child.on('spawn', () => logger.info('ytdlp_process_started', { sourceId: String(source._id), sourceName: source.name, executable, maxEntries: limit, metadataOnly: true, videoDownload: false }));
     child.on('error', err => { if (!settled) { settled = true; clearTimeout(timeout); clearInterval(heartbeat); reject(err); } });
     child.on('close', code => {
       clearTimeout(timeout); clearInterval(heartbeat);
@@ -51,14 +53,44 @@ function runYtDlp(source) {
 }
 function videoId(entry) { return entry.id || (entry.url && /^[\w-]{11}$/.test(entry.url) ? entry.url : null); }
 function videoUrl(entry, id) { return entry.webpage_url || entry.url && /^https?:/.test(entry.url) && entry.url || `https://www.youtube.com/watch?v=${id}`; }
-function findMatches(source, entry) {
-  const text = `${entry.title || ''}\n${entry.description || ''}`.toLocaleLowerCase();
+function findMatches(source, entry, description = entry.description || '') {
+  const includedDescription = source.scanDescription === false && source.generateNfo !== true ? '' : description;
+  const text = `${entry.title || ''}\n${includedDescription}`.toLocaleLowerCase();
   const excludes = source.excludeKeywords || [];
   if (excludes.some(k => k && text.includes(k.toLocaleLowerCase()))) return { accepted: false, matches: [] };
   const includes = (source.keywords || []).filter(Boolean);
   if (!includes.length) return { accepted: true, matches: [] };
   const matches = includes.filter(k => text.includes(k.toLocaleLowerCase()));
   return { accepted: source.matchMode === 'ALL' ? matches.length === includes.length : matches.length > 0, matches };
+}
+function xmlEscape(value) {
+  return String(value ?? '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+function xmlUnescape(value) {
+  return value.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+}
+function createNfo(entry, id) {
+  const plot = entry.description || '';
+  const date = entry.upload_date || entry.release_date || '';
+  const year = date.length >= 4 ? date.slice(0, 4) : '';
+  const runtime = Number.isFinite(entry.duration) ? Math.round(entry.duration) : '';
+  const thumbnail = entry.thumbnail || (Array.isArray(entry.thumbnails) && entry.thumbnails.at(-1)?.url) || '';
+  const url = videoUrl(entry, id);
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<movie>\n  <title>${xmlEscape(entry.title || id)}</title>\n  <plot>${xmlEscape(plot)}</plot>\n  <uniqueid type="youtube" default="true">${xmlEscape(id)}</uniqueid>\n  <url>${xmlEscape(url)}</url>\n  <premiered>${xmlEscape(date)}</premiered>\n  <year>${xmlEscape(year)}</year>\n  <runtime>${runtime}</runtime>\n  <thumb>${xmlEscape(thumbnail)}</thumb>\n</movie>\n`;
+}
+async function descriptionFromNfo(source, entry, id) {
+  const directory = process.env.NFO_DIRECTORY || path.join(process.cwd(), 'nfo');
+  const safeId = String(id).replace(/[^A-Za-z0-9_-]/g, '_');
+  const filePath = path.join(directory, String(source._id), `${safeId}.nfo`);
+  const nfo = createNfo(entry, id);
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, nfo, { encoding: 'utf8' });
+  const contents = await fs.readFile(filePath, 'utf8');
+  const plot = contents.match(/<plot>([\s\S]*?)<\/plot>/);
+  const description = plot ? xmlUnescape(plot[1]) : '';
+  logger.info('nfo_generated_and_read', { sourceId: String(source._id), sourceName: source.name, videoId: id, filePath, bytes: Buffer.byteLength(contents) });
+  return description;
 }
 async function upsertVideo(source, entry, matches) {
   const id = videoId(entry);
@@ -107,26 +139,28 @@ async function scanSource(source) {
   activeSources.add(sourceKey);
   const startedAt = new Date();
   const history = await ScanHistory.create({ sourceId: source._id, sourceName: source.name, sourceType: source.type, startedAt });
+  const limit = Number.isInteger(source.videosPerScan) ? Math.min(10000, Math.max(1, source.videosPerScan)) : LIMIT;
   let inspected = 0, matched = 0, rejected = 0; const errors = [];
-  logger.info('source_scan_started', { sourceId: sourceKey, sourceName: source.name, sourceType: source.type, maxEntries: LIMIT });
+  logger.info('source_scan_started', { sourceId: sourceKey, sourceName: source.name, sourceType: source.type, maxEntries: limit, scanDescription: source.scanDescription !== false, generateNfo: source.generateNfo === true });
   try {
-    const entries = await runYtDlp(source);
-    for (const entry of entries.slice(0, LIMIT)) {
+    const entries = await runYtDlp(source, limit);
+    for (const entry of entries.slice(0, limit)) {
       const id = videoId(entry); if (!id) continue;
       inspected++;
-      const result = findMatches(source, entry);
-      if (!result.accepted) {
-        rejected++;
-        logger.debug('video_rejected_by_keywords', { sourceId: sourceKey, youtubeId: id });
-        continue;
-      }
       try {
+        const description = source.generateNfo === true ? await descriptionFromNfo(source, entry, id) : (entry.description || '');
+        const result = findMatches(source, entry, description);
+        if (!result.accepted) {
+          rejected++;
+          logger.debug('video_rejected_by_keywords', { sourceId: sourceKey, youtubeId: id, descriptionChecked: source.scanDescription !== false, nfoUsed: source.generateNfo === true });
+          continue;
+        }
         await upsertVideo(source, entry, result.matches);
         matched++;
-        logger.debug('video_queued_or_refreshed', { sourceId: sourceKey, youtubeId: id, matchedKeywords: result.matches });
+        logger.debug('video_queued_or_refreshed', { sourceId: sourceKey, youtubeId: id, matchedKeywords: result.matches, descriptionChecked: source.scanDescription !== false, nfoUsed: source.generateNfo === true });
       } catch (err) {
         errors.push(`${id}: ${err.message}`);
-        logger.error('video_queue_update_failed', { sourceId: sourceKey, youtubeId: id, message: err.message });
+        logger.error('video_metadata_processing_failed', { sourceId: sourceKey, sourceName: source.name, youtubeId: id, nfoUsed: source.generateNfo === true, message: err.message });
       }
     }
     const completedAt = new Date();
@@ -152,7 +186,7 @@ async function scanAll() {
   activeAll = true;
   try {
     const sources = await Source.find({ enabled: true }).sort({ createdAt: 1 }).lean();
-    logger.info('full_scan_started', { enabledSources: sources.length, maxEntriesPerSource: LIMIT });
+    logger.info('full_scan_started', { enabledSources: sources.length, defaultMaxEntriesPerSource: LIMIT, perSourceLimitsEnabled: true });
     const results = [];
     for (const source of sources) results.push(await scanSource(source));
     logger.info('full_scan_completed', { sourceCount: results.length, scanned: results.filter(item => !item.skipped).length, skipped: results.filter(item => item.skipped).length });

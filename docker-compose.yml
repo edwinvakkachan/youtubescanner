@@ -9,8 +9,15 @@ services:
       MONGODB_URI: ${MONGODB_URI:?Set MONGODB_URI in the Compose or Portainer stack environment}
       YT_DLP_PATH: /opt/yt-dlp/bin/yt-dlp
       LOG_LEVEL: ${LOG_LEVEL:-debug}
+      NFO_DIRECTORY: /nfo
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
+    volumes:
+      - type: bind
+        source: ${NFO_HOST_PATH:-./nfo}
+        target: /nfo
+        bind:
+          create_host_path: true
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
