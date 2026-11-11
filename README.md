@@ -117,7 +117,7 @@ Collections are `sources`, `youtube_queue`, and `scan_history`. Mongoose creates
 
 ## Run with Docker Compose
 
-Docker Compose starts only the scanner app. It installs yt-dlp inside the app image and reads the online MongoDB connection string from `MONGODB_URI` in the project `.env` file. It does not install or start MongoDB.
+Docker Compose starts only the scanner app. It installs yt-dlp inside the app image and reads the online MongoDB connection string from `MONGODB_URI` supplied to Compose. It does not install or start MongoDB. The Compose file does not require an `env_file: .env` path, so it also works when Portainer supplies the environment file for the stack.
 
 ```sh
 docker compose up -d --build --remove-orphans
@@ -127,7 +127,7 @@ docker compose logs -f app
 
 Open `http://localhost:3000`. Run a one-off scan with `docker compose exec app npm run scan`. Stop the app with `docker compose down`; data remains in the online MongoDB instance.
 
-Set `MONGODB_URI` in `.env` to your provider's full connection string. The Compose file passes that value directly to the app and fails configuration if it is missing. Set `PORT` to change the published and container app port.
+For local Compose, set `MONGODB_URI` in `.env` to your provider's full connection string; Compose automatically reads `.env` for variable substitution. In Portainer, add `MONGODB_URI` and any optional settings such as `PORT`, `VIDEOS_PER_SOURCE`, `MAX_RETRIES`, `REQUIRE_MANUAL_APPROVAL`, and `LOG_LEVEL` in the stack environment variables or uploaded environment file. Deployment fails clearly if `MONGODB_URI` is missing. Set `PORT` to change the published and container app port.
 
 Application logs are structured JSON with ISO timestamps and are written to stdout/stderr, so they are visible with `docker compose logs -f --tail 200 app`. The default Docker `LOG_LEVEL=debug` includes per-video match/rejection records, scan counts and duration, API request status, startup/index status, and errors. Set `LOG_LEVEL=info` in `.env` to reduce per-video detail. Docker retains rotated logs using the configured `json-file` logging driver (three 10 MB files).
 
