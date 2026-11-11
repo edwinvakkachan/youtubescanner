@@ -1,6 +1,7 @@
 'use strict';
 require('dotenv').config();
 const { spawn } = require('node:child_process');
+const readline = require('node:readline');
 const { connectDB } = require('./db');
 const { Source, QueuedVideo, ScanHistory } = require('./models');
 const logger = require('./logger');
@@ -11,27 +12,40 @@ const PRIORITY_RANK = { HIGH: 1, NORMAL: 2, LOW: 3 };
 let activeAll = false;
 const activeSources = new Set();
 
-function runYtDlp(url) {
+function runYtDlp(source) {
   return new Promise((resolve, reject) => {
-    const args = ['--dump-json', '--playlist-end', String(LIMIT), '--ignore-errors', '--no-warnings', '--skip-download', url];
-    const child = spawn(process.env.YT_DLP_PATH || 'yt-dlp', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = ''; let stderr = ''; let settled = false;
-    const timeout = setTimeout(() => { child.kill(); if (!settled) { settled = true; reject(new Error('yt-dlp timed out after 5 minutes')); } }, 300000);
+    const executable = process.env.YT_DLP_PATH || 'yt-dlp';
+    const args = ['--dump-json', '--playlist-end', String(LIMIT), '--ignore-errors', '--no-warnings', '--skip-download', source.url];
+    const child = spawn(executable, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const entries = [];
+    let stderr = ''; let settled = false; let parseErrors = 0;
+    const timeout = setTimeout(() => { child.kill(); if (!settled) { settled = true; clearInterval(heartbeat); reject(new Error('yt-dlp timed out after 5 minutes')); } }, 300000);
+    const heartbeat = setInterval(() => logger.info('ytdlp_process_still_running', { sourceId: String(source._id), sourceName: source.name, elapsedSeconds: Math.floor((Date.now() - startedAt) / 1000), metadataEntriesReceived: entries.length }), 30000);
+    const startedAt = Date.now();
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
-    child.stdout.on('data', chunk => { stdout += chunk; });
-    child.stderr.on('data', chunk => { stderr += chunk; });
-    child.on('error', err => { if (!settled) { settled = true; clearTimeout(timeout); reject(err); } });
+    const outputLines = readline.createInterface({ input: child.stdout });
+    outputLines.on('line', line => {
+      if (!line.trim()) return;
+      try {
+        const entry = JSON.parse(line);
+        entries.push(entry);
+        logger.info('ytdlp_video_metadata_received', { sourceId: String(source._id), sourceName: source.name, videoNumber: entries.length, videoId: entry.id || null, title: String(entry.title || '').slice(0, 180), uploadDate: entry.upload_date || null, durationSeconds: entry.duration ?? null });
+      } catch (err) {
+        parseErrors++;
+        logger.warn('ytdlp_metadata_line_invalid', { sourceId: String(source._id), sourceName: source.name, message: err.message });
+      }
+    });
+    child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-4000); });
+    child.on('spawn', () => logger.info('ytdlp_process_started', { sourceId: String(source._id), sourceName: source.name, executable, maxEntries: LIMIT, metadataOnly: true, videoDownload: false }));
+    child.on('error', err => { if (!settled) { settled = true; clearTimeout(timeout); clearInterval(heartbeat); reject(err); } });
     child.on('close', code => {
-      clearTimeout(timeout);
+      clearTimeout(timeout); clearInterval(heartbeat);
       if (settled) return;
       settled = true;
-      if (code !== 0 && stdout.trim()) logger.warn('ytdlp_partial_exit', { exitCode: code, stderr: stderr.trim().slice(0, 2000) });
-      if (code !== 0 && !stdout.trim()) return reject(new Error((stderr.trim() || `yt-dlp exited ${code}`).slice(0, 2000)));
-      try {
-        const lines = stdout.split(/\r?\n/).filter(line => line.trim());
-        const entries = lines.map(line => JSON.parse(line));
-        resolve(entries.filter(Boolean));
-      } catch { reject(new Error(`Unable to parse yt-dlp JSON output: ${stderr.slice(0, 800)}`)); }
+      if (code !== 0 && entries.length) logger.warn('ytdlp_partial_exit', { sourceId: String(source._id), sourceName: source.name, exitCode: code, metadataEntriesReceived: entries.length, stderr: stderr.trim().slice(-2000) });
+      if (code !== 0 && !entries.length) return reject(new Error((stderr.trim() || `yt-dlp exited ${code}`).slice(-2000)));
+      logger.info('ytdlp_process_finished', { sourceId: String(source._id), sourceName: source.name, exitCode: code, metadataEntriesReceived: entries.length, invalidLines: parseErrors, durationMs: Date.now() - startedAt });
+      resolve(entries);
     });
   });
 }
@@ -94,7 +108,7 @@ async function scanSource(source) {
   let inspected = 0, matched = 0, rejected = 0; const errors = [];
   logger.info('source_scan_started', { sourceId: sourceKey, sourceName: source.name, sourceType: source.type, maxEntries: LIMIT });
   try {
-    const entries = await runYtDlp(source.url);
+    const entries = await runYtDlp(source);
     for (const entry of entries.slice(0, LIMIT)) {
       const id = videoId(entry); if (!id) continue;
       inspected++;

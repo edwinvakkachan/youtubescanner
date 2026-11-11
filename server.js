@@ -3,8 +3,9 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const { connectDB } = require('./db');
-const { Source, QueuedVideo, ScanHistory } = require('./models');
+const { Source, QueuedVideo, ScanHistory, ScannerSettings } = require('./models');
 const scanner = require('./scanner');
+const scheduler = require('./scheduler');
 const logger = require('./logger');
 const app = express();
 app.use((req, res, next) => {
@@ -77,6 +78,31 @@ app.post('/api/scan', async (_req, res, next) => { try { if (scanPromise) return
 app.post('/api/scan/:sourceId', async (req, res, next) => { try { objectId(req.params.sourceId); const result = await scanner.scanOne(req.params.sourceId); res.json(result); } catch (e) { next(e); } });
 app.get('/api/scan-history', async (req, res, next) => { try { const page = Math.max(1, Number.parseInt(req.query.page || '1', 10) || 1); const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit || '50', 10) || 50)); const [items, total] = await Promise.all([ScanHistory.find().sort({ startedAt: -1 }).skip((page - 1) * limit).limit(limit).lean(), ScanHistory.countDocuments()]); res.json({ items, total, page, limit }); } catch (e) { next(e); } });
 app.get('/api/scan-history/:sourceId', async (req, res, next) => { try { objectId(req.params.sourceId); res.json(await ScanHistory.find({ sourceId: req.params.sourceId }).sort({ startedAt: -1 }).limit(100).lean()); } catch (e) { next(e); } });
+app.get('/api/settings/scan', async (_req, res, next) => {
+  try {
+    const settings = await scheduler.getSettings();
+    res.json({ autoScanEnabled: settings.autoScanEnabled, scanIntervalMinutes: settings.scanIntervalMinutes, nextScanAt: scheduler.getNextScanAt() });
+  } catch (e) { next(e); }
+});
+app.put('/api/settings/scan', async (req, res, next) => {
+  try {
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) return res.status(400).json({ error: 'JSON object required' });
+    const updates = {};
+    if ('autoScanEnabled' in req.body) {
+      if (typeof req.body.autoScanEnabled !== 'boolean') return res.status(400).json({ error: 'autoScanEnabled must be boolean' });
+      updates.autoScanEnabled = req.body.autoScanEnabled;
+    }
+    if ('scanIntervalMinutes' in req.body) {
+      const value = req.body.scanIntervalMinutes;
+      if (!Number.isInteger(value) || value < 1 || value > 10080) return res.status(400).json({ error: 'scanIntervalMinutes must be an integer from 1 to 10080' });
+      updates.scanIntervalMinutes = value;
+    }
+    if (!Object.keys(updates).length) return res.status(400).json({ error: 'Provide autoScanEnabled or scanIntervalMinutes' });
+    const settings = await scheduler.updateSettings(updates);
+    logger.info('automatic_scan_settings_updated', { autoScanEnabled: settings.autoScanEnabled, intervalMinutes: settings.scanIntervalMinutes, nextScanAt: scheduler.getNextScanAt()?.toISOString() || null });
+    res.json({ autoScanEnabled: settings.autoScanEnabled, scanIntervalMinutes: settings.scanIntervalMinutes, nextScanAt: scheduler.getNextScanAt() });
+  } catch (e) { next(e); }
+});
 app.get('/api/stats', async (_req, res, next) => { try { const [sources, queue] = await Promise.all([Source.countDocuments(), QueuedVideo.aggregate([{ $group: { _id: null, total: { $sum: 1 }, pendingApproval: { $sum: { $cond: [{ $eq: ['$approvalStatus', 'PENDING'] }, 1, 0] } }, approved: { $sum: { $cond: [{ $eq: ['$approvalStatus', 'APPROVED'] }, 1, 0] } }, pendingImports: { $sum: { $cond: [{ $and: [{ $eq: ['$status', 'PENDING'] }, { $eq: ['$approvalStatus', 'APPROVED'] }] }, 1, 0] } }, processed: { $sum: { $cond: [{ $eq: ['$status', 'PROCESSED'] }, 1, 0] } }, failed: { $sum: { $cond: [{ $eq: ['$status', 'FAILED'] }, 1, 0] } } } }])]); res.json({ sources, ...(queue[0] || { total: 0, pendingApproval: 0, approved: 0, pendingImports: 0, processed: 0, failed: 0 }) }); } catch (e) { next(e); } });
 app.use((err, _req, res, _next) => {
   logger.error('http_request_exception', { message: err.message, stack: err.stack });
@@ -87,10 +113,11 @@ async function start() {
   logger.info('server_starting', { port: Number(process.env.PORT || 3000), logLevel: process.env.LOG_LEVEL || 'info' });
   await connectDB();
   logger.info('mongodb_connected');
-  await Promise.all([Source.init(), QueuedVideo.init(), ScanHistory.init()]);
-  logger.info('mongodb_indexes_ready', { collections: ['sources', 'youtube_queue', 'scan_history'] });
+  await Promise.all([Source.init(), QueuedVideo.init(), ScanHistory.init(), ScannerSettings.init()]);
+  logger.info('mongodb_indexes_ready', { collections: ['sources', 'youtube_queue', 'scan_history', 'scanner_settings'] });
   const port = Number(process.env.PORT || 3000);
   app.listen(port, '0.0.0.0', () => logger.info('server_listening', { port, trustedLanOnly: true }));
+  await scheduler.startScheduler();
 }
 if (require.main === module) start().catch(err => { logger.error('server_startup_failed', { message: err.message, stack: err.stack }); process.exit(1); });
 module.exports = app;

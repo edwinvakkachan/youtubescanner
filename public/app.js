@@ -22,8 +22,12 @@ async function stats() {
 }
 function shell(title, subtitle, right = '') { $('#heading').textContent = title; $('#crumb').textContent = `WORKSPACE / ${title.toUpperCase()}`; return `<div class="panel"><div class="panelhead"><div><h2>${title}</h2><p>${subtitle}</p></div>${right}</div>`; }
 async function renderOverview() {
-  const latest = await api('/api/queue?limit=8&page=1'); const history = await api('/api/scan-history?limit=5&page=1');
-  $('#content').innerHTML = `${shell('Recent discoveries', 'Latest videos added to the unique discovery queue', '<button class="button" data-goto="queue">View import queue</button>')}${videoRows(latest.items, 'none')}</div><div class="panel"><div class="panelhead"><div><h2>Recent scans</h2><p>Latest source scan activity</p></div><button class="button" data-goto="history">All scan history</button></div>${history.items.length ? `<div class="tablewrap"><table><thead><tr><th>Source</th><th>Status</th><th>Inspected</th><th>Matched</th><th>Errors</th><th>Started</th></tr></thead><tbody>${history.items.map(x => `<tr><td><b>${escapeHtml(x.sourceName)}</b><div class="sub">${escapeHtml(x.sourceType)}</div></td><td>${badge(x.status)}</td><td>${x.inspected}</td><td>${x.matched}</td><td>${x.errorCount ?? x.errors ?? 0}</td><td>${x.startedAt ? new Date(x.startedAt).toLocaleString() : '—'}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No scans have run.</div>'}</div>`;
+  const [latest, history, settings] = await Promise.all([
+    api('/api/queue?limit=8&page=1'), api('/api/scan-history?limit=5&page=1'), api('/api/settings/scan')
+  ]);
+  const nextScan = settings.nextScanAt ? new Date(settings.nextScanAt).toLocaleString() : 'Automatic scanning is paused';
+  const schedulePanel = `<div class="panel"><div class="panelhead"><div><h2>Automatic scanning</h2><p>Scans all enabled sources using the saved interval</p></div>${badge(settings.autoScanEnabled ? 'ENABLED' : 'DISABLED')}</div><form id="scanSettingsForm" class="toolbar"><label class="schedule-enable"><input name="autoScanEnabled" type="checkbox" ${settings.autoScanEnabled ? 'checked' : ''}> Enable automatic scans</label><label class="schedule-interval">Scan interval (minutes)<input name="scanIntervalMinutes" type="number" min="1" max="10080" value="${settings.scanIntervalMinutes}" required></label><button class="button primary">Save schedule</button></form><p class="sub schedule-next">Next scan: ${escapeHtml(nextScan)} · Default interval: 360 minutes. Allowed interval: 1–10080 minutes.</p></div>`;
+  $('#content').innerHTML = `${schedulePanel}${shell('Recent discoveries', 'Latest videos added to the unique discovery queue', '<button class="button" data-goto="queue">View import queue</button>')}${videoRows(latest.items, 'none')}</div><div class="panel"><div class="panelhead"><div><h2>Recent scans</h2><p>Latest source scan activity</p></div><button class="button" data-goto="history">All scan history</button></div>${history.items.length ? `<div class="tablewrap"><table><thead><tr><th>Source</th><th>Status</th><th>Inspected</th><th>Matched</th><th>Errors</th><th>Started</th></tr></thead><tbody>${history.items.map(x => `<tr><td><b>${escapeHtml(x.sourceName)}</b><div class="sub">${escapeHtml(x.sourceType)}</div></td><td>${badge(x.status)}</td><td>${x.inspected}</td><td>${x.matched}</td><td>${x.errorCount ?? x.errors ?? 0}</td><td>${x.startedAt ? new Date(x.startedAt).toLocaleString() : '—'}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No scans have run.</div>'}</div>`;
 }
 async function renderSources() {
   const sources = await api('/api/sources');
@@ -99,6 +103,16 @@ $('#content').addEventListener('click', async e => {
 });
 $('#content').addEventListener('change', async e => { if (e.target.id === 'keywordSource') { try { const sources = await api('/api/sources'); const source = sources.find(s => s._id === e.target.value); if (source) await fillKeywords(source); } catch (err) { toast(err.message, true); } } });
 $('#sourceForm').addEventListener('submit', async e => { e.preventDefault(); const f = e.currentTarget; const body = { name: f.elements.name.value.trim(), url: f.elements.url.value.trim(), type: f.elements.type.value, priority: f.elements.priority.value, matchMode: f.elements.matchMode.value, enabled: f.elements.enabled.checked, keywords: splitWords(f.elements.keywords.value), excludeKeywords: splitWords(f.elements.excludeKeywords.value) }; try { const id = f.elements.id.value; await api(id ? `/api/sources/${id}` : '/api/sources', { method: id ? 'PUT' : 'POST', body: JSON.stringify(body) }); $('#sourceDialog').close(); toast(id ? 'Source updated' : 'Source added'); await render(); } catch (err) { toast(err.message, true); } });
+$('#content').addEventListener('submit', async e => {
+  if (e.target.id !== 'scanSettingsForm') return;
+  e.preventDefault();
+  const form = e.target;
+  try {
+    const updated = await api('/api/settings/scan', { method: 'PUT', body: JSON.stringify({ autoScanEnabled: form.elements.autoScanEnabled.checked, scanIntervalMinutes: Number(form.elements.scanIntervalMinutes.value) }) });
+    toast(updated.autoScanEnabled ? `Automatic scan interval saved: every ${updated.scanIntervalMinutes} minutes` : 'Automatic scanning paused');
+    await render();
+  } catch (err) { toast(err.message, true); }
+});
 $('#closeDialog').onclick = $('#cancelDialog').onclick = () => $('#sourceDialog').close();
 $('#scanAll').onclick = async () => { try { await api('/api/scan', { method: 'POST' }); toast('Full scan started. Results appear in Scan History.'); } catch (err) { toast(err.message, true); } };
 render().catch(err => toast(`Dashboard could not load: ${err.message}`, true));

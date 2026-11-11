@@ -19,6 +19,8 @@ Run discovery independently with `npm run scan`; this scans every enabled source
 
 `VIDEOS_PER_SOURCE` controls the maximum entries scanned per source (default 50). `REQUIRE_MANUAL_APPROVAL=true` puts new discoveries in pending approval; when false, new videos are approved automatically. Existing approval decisions are kept. `MAX_RETRIES` sets the initial retry ceiling for new queue records.
 
+The server automatically scans enabled sources every 360 minutes by default. Change the interval or pause/resume automatic scans from the Overview dashboard; settings are stored in MongoDB and survive container restarts. The interval can be set from 1 to 10080 minutes. `npm run scan` remains a one-shot scan.
+
 ## Scanner behavior
 
 - `yt-dlp --dump-json --playlist-end N --ignore-errors --no-warnings --skip-download` retrieves metadata only. The scanner stores title, description, thumbnail, upload date, duration, and YouTube ID.
@@ -32,7 +34,7 @@ Run discovery independently with `npm run scan`; this scans every enabled source
 
 Sources: `GET/POST /api/sources`, `PUT/DELETE /api/sources/:id`. A source POST accepts `name`, `url`, `type` (`channel`, `playlist`, `shorts`), `keywords`, `excludeKeywords`, `matchMode` (`ANY`/`ALL`), `priority` (`HIGH`/`NORMAL`/`LOW`), and `enabled`.
 
-Queue: `GET /api/queue` accepts `status`, `approvalStatus`, `priority`, `q`, `page`, and `limit` (maximum 100). Approval: `POST /api/queue/:id/approve`, `/reject`, and `/api/queue/bulk-approve` with `{ "ids": ["..."] }`. Retry: `POST /api/queue/:id/retry` or `/api/queue/bulk-retry` for eligible failures. `POST /api/queue/:id/reset` manually resets a non-rejected failed record and its retry counter. Scanning: `POST /api/scan`, `POST /api/scan/:sourceId`. History: `GET /api/scan-history` and `/api/scan-history/:sourceId`. Statistics: `GET /api/stats`. All API responses are JSON.
+Queue: `GET /api/queue` accepts `status`, `approvalStatus`, `priority`, `q`, `page`, and `limit` (maximum 100). Approval: `POST /api/queue/:id/approve`, `/reject`, and `/api/queue/bulk-approve` with `{ "ids": ["..."] }`. Retry: `POST /api/queue/:id/retry` or `/api/queue/bulk-retry` for eligible failures. `POST /api/queue/:id/reset` manually resets a non-rejected failed record and its retry counter. Scanning: `POST /api/scan`, `POST /api/scan/:sourceId`. History: `GET /api/scan-history` and `/api/scan-history/:sourceId`. Scan scheduling: `GET/PUT /api/settings/scan` (`autoScanEnabled`, `scanIntervalMinutes`, valid range 1–10080). Statistics: `GET /api/stats`. All API responses are JSON.
 
 ## MongoDB example documents
 
@@ -113,7 +115,7 @@ The queue marks permanently exhausted failures as FAILED. Rejected videos should
 
 ## Operational notes
 
-Collections are `sources`, `youtube_queue`, and `scan_history`. Mongoose creates the unique URL and YouTube ID indexes and queue/history query indexes on startup. The app is suitable for ARM64 systems when compatible Node.js, MongoDB, and yt-dlp builds are installed.
+Collections are `sources`, `youtube_queue`, `scan_history`, and `scanner_settings`. Mongoose creates the unique URL and YouTube ID indexes and queue/history query indexes on startup. The app is suitable for ARM64 systems when compatible Node.js, MongoDB, and yt-dlp builds are installed.
 
 ## Run with Docker Compose
 

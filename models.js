@@ -53,8 +53,15 @@ const historySchema = new Schema({
 historySchema.index({ sourceId: 1, startedAt: -1 });
 historySchema.index({ startedAt: -1 });
 
+const scannerSettingsSchema = new Schema({
+  _id: { type: String, default: 'global' },
+  autoScanEnabled: { type: Boolean, default: true },
+  scanIntervalMinutes: { type: Number, default: 360, min: 1, max: 10080 }
+}, { timestamps: true, collection: 'scanner_settings' });
+
 module.exports = {
   Source: mongoose.models.Source || mongoose.model('Source', sourceSchema, 'sources'),
   QueuedVideo: mongoose.models.QueuedVideo || mongoose.model('QueuedVideo', queueSchema, 'youtube_queue'),
-  ScanHistory: mongoose.models.ScanHistory || mongoose.model('ScanHistory', historySchema, 'scan_history')
+  ScanHistory: mongoose.models.ScanHistory || mongoose.model('ScanHistory', historySchema, 'scan_history'),
+  ScannerSettings: mongoose.models.ScannerSettings || mongoose.model('ScannerSettings', scannerSettingsSchema)
 };
