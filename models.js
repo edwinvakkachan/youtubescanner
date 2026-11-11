@@ -10,6 +10,7 @@ const sourceSchema = new Schema({
   excludeKeywords: { type: [String], default: [] },
   matchMode: { type: String, enum: ['ANY', 'ALL'], default: 'ANY' },
   priority: { type: String, enum: ['HIGH', 'NORMAL', 'LOW'], default: 'NORMAL' },
+  autoApproveVideos: { type: Boolean, default: false },
   enabled: { type: Boolean, default: true },
   lastScannedAt: { type: Date, default: null },
   scanLockUntil: { type: Date, default: null, select: false }

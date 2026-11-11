@@ -32,7 +32,7 @@ The server automatically scans enabled sources every 360 minutes by default. Cha
 
 ## API
 
-Sources: `GET/POST /api/sources`, `PUT/DELETE /api/sources/:id`. A source POST accepts `name`, `url`, `type` (`channel`, `playlist`, `shorts`), `keywords`, `excludeKeywords`, `matchMode` (`ANY`/`ALL`), `priority` (`HIGH`/`NORMAL`/`LOW`), and `enabled`.
+Sources: `GET/POST /api/sources`, `PUT/DELETE /api/sources/:id`. A source POST accepts `name`, `url`, `type` (`channel`, `playlist`, `shorts`), `keywords`, `excludeKeywords`, `matchMode` (`ANY`/`ALL`), `priority` (`HIGH`/`NORMAL`/`LOW`), `enabled`, and channel-only `autoApproveVideos`. When enabled, matching videos from that channel are approved automatically and bypass the manual approval step.
 
 Queue: `GET /api/queue` accepts `status`, `approvalStatus`, `priority`, `q`, `page`, and `limit` (maximum 100). Approval: `POST /api/queue/:id/approve`, `/reject`, and `/api/queue/bulk-approve` with `{ "ids": ["..."] }`. Retry: `POST /api/queue/:id/retry` or `/api/queue/bulk-retry` for eligible failures. `POST /api/queue/:id/reset` manually resets a non-rejected failed record and its retry counter. Scanning: `POST /api/scan`, `POST /api/scan/:sourceId`. History: `GET /api/scan-history` and `/api/scan-history/:sourceId`. Scan scheduling: `GET/PUT /api/settings/scan` (`autoScanEnabled`, `scanIntervalMinutes`, valid range 1–10080). Statistics: `GET /api/stats`. All API responses are JSON.
 

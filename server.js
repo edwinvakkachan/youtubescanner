@@ -33,7 +33,7 @@ function cleanKeywords(value) {
 function sourceInput(body, partial = false) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw Object.assign(new Error('JSON object required'), { status: 400 });
   const out = {};
-  for (const key of ['name', 'url', 'type', 'matchMode', 'priority', 'enabled', 'keywords', 'excludeKeywords']) {
+  for (const key of ['name', 'url', 'type', 'matchMode', 'priority', 'enabled', 'autoApproveVideos', 'keywords', 'excludeKeywords']) {
     if (!(key in body)) continue;
     const value = body[key];
     if (key === 'name') { if (typeof value !== 'string' || !value.trim() || value.length > 160) throw Object.assign(new Error('Name is required (max 160 chars)'), { status: 400 }); out.name = value.trim(); }
@@ -42,8 +42,11 @@ function sourceInput(body, partial = false) {
     else if (key === 'matchMode') { if (!matchModes.includes(value)) throw Object.assign(new Error('matchMode must be ANY or ALL'), { status: 400 }); out.matchMode = value; }
     else if (key === 'priority') { if (!priorities.includes(value)) throw Object.assign(new Error('Invalid priority'), { status: 400 }); out.priority = value; }
     else if (key === 'enabled') { if (typeof value !== 'boolean') throw Object.assign(new Error('enabled must be boolean'), { status: 400 }); out.enabled = value; }
+    else if (key === 'autoApproveVideos') { if (typeof value !== 'boolean') throw Object.assign(new Error('autoApproveVideos must be boolean'), { status: 400 }); out.autoApproveVideos = value; }
     else out[key] = cleanKeywords(value);
   }
+  if (out.type && out.type !== 'channel' && out.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 });
+  if (out.type && out.type !== 'channel' && out.autoApproveVideos === undefined) out.autoApproveVideos = false;
   if (!partial && (!out.name || !out.url || !out.type)) throw Object.assign(new Error('name, url and type are required'), { status: 400 });
   return out;
 }
@@ -52,7 +55,7 @@ function rankSort() { return { priorityRank: 1, discoveredAt: 1 }; }
 app.get('/api/health', (_req, res) => res.json({ ok: true, database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 app.get('/api/sources', async (_req, res, next) => { try { res.json(await Source.find().sort({ type: 1, name: 1 }).lean()); } catch (e) { next(e); } });
 app.post('/api/sources', async (req, res, next) => { try { res.status(201).json(await Source.create(sourceInput(req.body))); } catch (e) { next(e); } });
-app.put('/api/sources/:id', async (req, res, next) => { try { objectId(req.params.id); const source = await Source.findByIdAndUpdate(req.params.id, { $set: sourceInput(req.body, true) }, { new: true, runValidators: true }); if (!source) return res.status(404).json({ error: 'Source not found' }); res.json(source); } catch (e) { next(e); } });
+app.put('/api/sources/:id', async (req, res, next) => { try { objectId(req.params.id); const updates = sourceInput(req.body, true); const current = await Source.findById(req.params.id).select('type'); if (!current) return res.status(404).json({ error: 'Source not found' }); if ((updates.type || current.type) !== 'channel' && updates.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 }); const source = await Source.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true, runValidators: true }); res.json(source); } catch (e) { next(e); } });
 app.delete('/api/sources/:id', async (req, res, next) => { try { objectId(req.params.id); const source = await Source.findByIdAndDelete(req.params.id); if (!source) return res.status(404).json({ error: 'Source not found' }); res.json({ deleted: true }); } catch (e) { next(e); } });
 app.get('/api/queue', async (req, res, next) => { try {
   const page = Math.max(1, Math.min(1000000, Number.parseInt(req.query.page || '1', 10) || 1));

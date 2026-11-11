@@ -72,9 +72,12 @@ async function render() {
 function showSource(source = null) {
   const form = $('#sourceForm'); form.reset(); form.elements.id.value = source?._id || ''; $('#formTitle').textContent = source ? 'Edit source' : 'Add a source';
   form.elements.enabled.checked = source?.enabled ?? true;
+  form.elements.autoApproveVideos.checked = source?.autoApproveVideos ?? false;
   for (const key of ['name', 'url', 'type', 'priority', 'matchMode']) if (source && source[key] !== undefined) form.elements[key].value = source[key];
+  $('#autoApproveField').hidden = form.elements.type.value !== 'channel';
   form.elements.keywords.value = (source?.keywords || []).join(', '); form.elements.excludeKeywords.value = (source?.excludeKeywords || []).join(', '); $('#sourceDialog').showModal();
 }
+$('#sourceForm').elements.type.addEventListener('change', e => { $('#autoApproveField').hidden = e.target.value !== 'channel'; });
 function splitWords(s) { return s.split(',').map(x => x.trim()).filter(Boolean); }
 async function fillKeywords(source) {
   const box = $('#keywordEditor'); box.className = ''; box.innerHTML = `<div class="formgrid"><label>Include keywords<small> (comma separated)</small><textarea id="kwIncludes" rows="4">${escapeHtml((source.keywords || []).join(', '))}</textarea></label><label>Exclude keywords<small> (always take priority)</small><textarea id="kwExcludes" rows="4">${escapeHtml((source.excludeKeywords || []).join(', '))}</textarea></label><label>Match mode<select id="kwMode"><option ${source.matchMode === 'ANY' ? 'selected' : ''}>ANY</option><option ${source.matchMode === 'ALL' ? 'selected' : ''}>ALL</option></select></label><div class="actions"><button class="button" id="clearKeywords">Delete all keywords</button><button class="button primary" id="saveKeywords">Save keyword rules</button></div></div>`;
@@ -102,7 +105,7 @@ $('#content').addEventListener('click', async e => {
   } catch (err) { toast(err.message, true); }
 });
 $('#content').addEventListener('change', async e => { if (e.target.id === 'keywordSource') { try { const sources = await api('/api/sources'); const source = sources.find(s => s._id === e.target.value); if (source) await fillKeywords(source); } catch (err) { toast(err.message, true); } } });
-$('#sourceForm').addEventListener('submit', async e => { e.preventDefault(); const f = e.currentTarget; const body = { name: f.elements.name.value.trim(), url: f.elements.url.value.trim(), type: f.elements.type.value, priority: f.elements.priority.value, matchMode: f.elements.matchMode.value, enabled: f.elements.enabled.checked, keywords: splitWords(f.elements.keywords.value), excludeKeywords: splitWords(f.elements.excludeKeywords.value) }; try { const id = f.elements.id.value; await api(id ? `/api/sources/${id}` : '/api/sources', { method: id ? 'PUT' : 'POST', body: JSON.stringify(body) }); $('#sourceDialog').close(); toast(id ? 'Source updated' : 'Source added'); await render(); } catch (err) { toast(err.message, true); } });
+$('#sourceForm').addEventListener('submit', async e => { e.preventDefault(); const f = e.currentTarget; const body = { name: f.elements.name.value.trim(), url: f.elements.url.value.trim(), type: f.elements.type.value, priority: f.elements.priority.value, matchMode: f.elements.matchMode.value, enabled: f.elements.enabled.checked, autoApproveVideos: f.elements.type.value === 'channel' && f.elements.autoApproveVideos.checked, keywords: splitWords(f.elements.keywords.value), excludeKeywords: splitWords(f.elements.excludeKeywords.value) }; try { const id = f.elements.id.value; await api(id ? `/api/sources/${id}` : '/api/sources', { method: id ? 'PUT' : 'POST', body: JSON.stringify(body) }); $('#sourceDialog').close(); toast(id ? 'Source updated' : 'Source added'); await render(); } catch (err) { toast(err.message, true); } });
 $('#content').addEventListener('submit', async e => {
   if (e.target.id !== 'scanSettingsForm') return;
   e.preventDefault();

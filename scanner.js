@@ -66,7 +66,7 @@ async function upsertVideo(source, entry, matches) {
   const priority = source.priority || 'NORMAL';
   // Stable contribution allows $addToSet to deduplicate this source on rediscovery.
   const contribution = { sourceId: source._id, name: source.name, type: source.type, priority, matchedKeywords: matches };
-  const approval = String(process.env.REQUIRE_MANUAL_APPROVAL || 'true').toLowerCase() === 'true' ? 'PENDING' : 'APPROVED';
+  const approval = source.autoApproveVideos || String(process.env.REQUIRE_MANUAL_APPROVAL || 'true').toLowerCase() !== 'true' ? 'APPROVED' : 'PENDING';
   const url = videoUrl(entry, id);
   try {
     await QueuedVideo.updateOne({ youtubeId: id }, {
@@ -82,6 +82,7 @@ async function upsertVideo(source, entry, matches) {
     }, { upsert: true });
     // Keep display priority aligned with the highest-priority source, without changing importer/approval state.
     await QueuedVideo.updateOne({ youtubeId: id, priorityRank: PRIORITY_RANK[priority] || 2 }, { $set: { priority } });
+    if (source.autoApproveVideos) await QueuedVideo.updateOne({ youtubeId: id, approvalStatus: 'PENDING' }, { $set: { approvalStatus: 'APPROVED' } });
   } catch (err) {
     if (err.code !== 11000) throw err;
     // Another scan inserted this ID between our lookup/upsert attempt. Add our
@@ -91,6 +92,7 @@ async function upsertVideo(source, entry, matches) {
       $min: { priorityRank: PRIORITY_RANK[priority] || 2 }
     });
     await QueuedVideo.updateOne({ youtubeId: id, priorityRank: PRIORITY_RANK[priority] || 2 }, { $set: { priority } });
+    if (source.autoApproveVideos) await QueuedVideo.updateOne({ youtubeId: id, approvalStatus: 'PENDING' }, { $set: { approvalStatus: 'APPROVED' } });
   }
 }
 async function scanSource(source) {
