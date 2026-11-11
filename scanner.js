@@ -106,7 +106,7 @@ async function upsertVideo(source, entry, matches) {
         youtubeId: id, title: entry.title || '', description: entry.description || '', url,
         thumbnail: entry.thumbnail || (Array.isArray(entry.thumbnails) && entry.thumbnails.at(-1)?.url) || '',
         uploadDate: entry.upload_date || entry.release_date || '', duration: Number.isFinite(entry.duration) ? entry.duration : null,
-        approvalStatus: approval, status: 'PENDING', retryCount: 0, maxRetries: MAX_RETRIES,
+        approvalStatus: approval, status: approval === 'APPROVED' ? 'PENDING' : 'AWAITING_APPROVAL', retryCount: 0, maxRetries: MAX_RETRIES,
         lastError: '', discoveredAt: new Date(), processedAt: null
       },
       $addToSet: { discoveredSources: contribution, matchedKeywords: { $each: matches } },
@@ -114,7 +114,7 @@ async function upsertVideo(source, entry, matches) {
     }, { upsert: true });
     // Keep display priority aligned with the highest-priority source, without changing importer/approval state.
     await QueuedVideo.updateOne({ youtubeId: id, priorityRank: PRIORITY_RANK[priority] || 2 }, { $set: { priority } });
-    if (source.autoApproveVideos) await QueuedVideo.updateOne({ youtubeId: id, approvalStatus: 'PENDING' }, { $set: { approvalStatus: 'APPROVED' } });
+    if (source.autoApproveVideos) await QueuedVideo.updateOne({ youtubeId: id, approvalStatus: 'PENDING', status: { $in: ['AWAITING_APPROVAL', 'PENDING'] } }, { $set: { approvalStatus: 'APPROVED', status: 'PENDING' } });
   } catch (err) {
     if (err.code !== 11000) throw err;
     // Another scan inserted this ID between our lookup/upsert attempt. Add our
@@ -124,7 +124,7 @@ async function upsertVideo(source, entry, matches) {
       $min: { priorityRank: PRIORITY_RANK[priority] || 2 }
     });
     await QueuedVideo.updateOne({ youtubeId: id, priorityRank: PRIORITY_RANK[priority] || 2 }, { $set: { priority } });
-    if (source.autoApproveVideos) await QueuedVideo.updateOne({ youtubeId: id, approvalStatus: 'PENDING' }, { $set: { approvalStatus: 'APPROVED' } });
+    if (source.autoApproveVideos) await QueuedVideo.updateOne({ youtubeId: id, approvalStatus: 'PENDING', status: { $in: ['AWAITING_APPROVAL', 'PENDING'] } }, { $set: { approvalStatus: 'APPROVED', status: 'PENDING' } });
   }
 }
 async function scanSource(source) {

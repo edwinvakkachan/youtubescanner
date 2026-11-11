@@ -39,7 +39,7 @@ const queueSchema = new Schema({
   priority: { type: String, enum: ['HIGH', 'NORMAL', 'LOW'], default: 'NORMAL' },
   priorityRank: { type: Number, enum: [1, 2, 3], default: 2 },
   approvalStatus: { type: String, enum: ['PENDING', 'APPROVED', 'REJECTED'], default: 'PENDING' },
-  status: { type: String, enum: ['PENDING', 'PROCESSING', 'PROCESSED', 'FAILED'], default: 'PENDING' },
+  status: { type: String, enum: ['AWAITING_APPROVAL', 'PENDING', 'PROCESSING', 'SENT', 'PROCESSED', 'FAILED'], default: 'PENDING' },
   retryCount: { type: Number, default: 0, min: 0 }, maxRetries: { type: Number, default: 3, min: 1 },
   lastError: { type: String, default: '' }, discoveredAt: { type: Date, default: Date.now },
   processedAt: { type: Date, default: null }

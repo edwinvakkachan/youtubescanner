@@ -26,6 +26,7 @@ The server automatically scans enabled sources every 360 minutes by default. Cha
 - `yt-dlp --dump-json --playlist-end N --ignore-errors --no-warnings --skip-download` retrieves metadata only. The scanner stores title, description, thumbnail, upload date, duration, and YouTube ID.
 - Include/exclude keywords are case-insensitive and search title plus description. Exclusions take precedence. Empty include rules accept any non-excluded video. ANY means at least one include term; ALL means every include term.
 - Each source can disable description matching to search titles only. With `generateNfo` enabled, the scanner writes a Kodi-style XML NFO for every inspected video, reads it back, and matches configured keywords against its `<plot>` description. NFO files contain metadata only; no video files are downloaded.
+- Manual-approval discoveries use `status: AWAITING_APPROVAL` until approved. On server startup, existing unapproved records still marked `status: PENDING` are migrated to `AWAITING_APPROVAL`; this also protects against importers that incorrectly filter only on `status`.
 - A unique index on `youtubeId` prevents duplicate queue records. Rediscovery adds the source contribution and matched terms, while `$setOnInsert` preserves approval, import status, retries, and original discovery time.
 - Queue priority is the highest priority among discovery sources: HIGH, then NORMAL, then LOW. `priorityRank` (1/2/3) is stored and importer queries should sort by it, then oldest `discoveredAt`.
 - Source deletion does not remove queue records or scan history.
@@ -35,7 +36,7 @@ The server automatically scans enabled sources every 360 minutes by default. Cha
 
 Sources: `GET/POST /api/sources`, `PUT/DELETE /api/sources/:id`. A source POST accepts `name`, `url`, `type` (`channel`, `playlist`, `shorts`), `videosPerScan` (1–10000), `scanDescription`, `generateNfo`, `keywords`, `excludeKeywords`, `matchMode` (`ANY`/`ALL`), `priority` (`HIGH`/`NORMAL`/`LOW`), `enabled`, and channel-only `autoApproveVideos`. When enabled, matching videos from that channel are approved automatically and bypass the manual approval step.
 
-Queue: `GET /api/queue` accepts `status`, `approvalStatus`, `priority`, `q`, `page`, and `limit` (maximum 100). Approval: `POST /api/queue/:id/approve`, `/reject`, and `/api/queue/bulk-approve` with `{ "ids": ["..."] }`. Retry: `POST /api/queue/:id/retry` or `/api/queue/bulk-retry` for eligible failures. `POST /api/queue/:id/reset` manually resets a non-rejected failed record and its retry counter. Scanning: `POST /api/scan`, `POST /api/scan/:sourceId`. History: `GET /api/scan-history` and `/api/scan-history/:sourceId`. Scan scheduling: `GET/PUT /api/settings/scan` (`autoScanEnabled`, `scanIntervalMinutes`, valid range 1–10080). Statistics: `GET /api/stats`. All API responses are JSON.
+Queue: `GET /api/queue` accepts `status`, `approvalStatus`, `priority`, `q`, `page`, and `limit` (maximum 100). `GET /api/queue?status=PENDING` returns only approved pending imports unless an approval filter is explicitly requested. `POST /api/queue/claim` with optional `{ "limit": 50 }` atomically claims only approved, eligible videos and marks them PROCESSING. Approval: `POST /api/queue/:id/approve`, `/reject`, and `/api/queue/bulk-approve` with `{ "ids": ["..."] }`. Decisions are locked after an item is claimed or sent. Retry: `POST /api/queue/:id/retry` or `/api/queue/bulk-retry` for eligible failures. `POST /api/queue/:id/reset` manually resets a non-rejected failed record and its retry counter. Scanning: `POST /api/scan`, `POST /api/scan/:sourceId`. History: `GET /api/scan-history` and `/api/scan-history/:sourceId`. Scan scheduling: `GET/PUT /api/settings/scan` (`autoScanEnabled`, `scanIntervalMinutes`, valid range 1–10080). Statistics: `GET /api/stats`. All API responses are JSON.
 
 ## MongoDB example documents
 
@@ -75,7 +76,7 @@ Queue: `GET /api/queue` accepts `status`, `approvalStatus`, `priority`, `q`, `pa
   "priority": "HIGH",
   "priorityRank": 1,
   "approvalStatus": "PENDING",
-  "status": "PENDING",
+  "status": "AWAITING_APPROVAL",
   "retryCount": 0,
   "maxRetries": 3,
   "lastError": "",
@@ -88,7 +89,7 @@ Queue: `GET /api/queue` accepts `status`, `approvalStatus`, `priority`, `q`, `pa
 
 ## TubeArchivist importer example
 
-The importer can connect using its own Mongoose connection and the same queue schema, or define a compatible model targeting `youtube_queue`. Import only approved, eligible videos; `priorityRank` and the timestamp give the requested order:
+The importer can connect using its own Mongoose connection and the same queue schema, or define a compatible model targeting `youtube_queue`. **Never select import work using `status: 'PENDING'` alone.** The eligibility query must also require `approvalStatus: 'APPROVED'` and `retryCount < maxRetries`; rejected and pending-approval records must not be sent. `priorityRank` and the timestamp give the requested order:
 
 ```js
 const videos = await QueuedVideo.find({

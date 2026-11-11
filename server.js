@@ -64,20 +64,41 @@ app.get('/api/queue', async (req, res, next) => { try {
   const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit || '50', 10) || 50));
   const filter = {};
   for (const key of ['status', 'approvalStatus', 'priority']) if (req.query[key]) {
-    const allowed = key === 'status' ? ['PENDING', 'PROCESSING', 'PROCESSED', 'FAILED'] : key === 'approvalStatus' ? ['PENDING', 'APPROVED', 'REJECTED'] : priorities;
+    const allowed = key === 'status' ? ['AWAITING_APPROVAL', 'PENDING', 'PROCESSING', 'SENT', 'PROCESSED', 'FAILED'] : key === 'approvalStatus' ? ['PENDING', 'APPROVED', 'REJECTED'] : priorities;
     if (!allowed.includes(req.query[key])) return res.status(400).json({ error: `Invalid ${key}` }); filter[key] = req.query[key];
   }
+  // Treat a PENDING queue request as an importer request: never expose pending
+  // or rejected approvals unless the caller explicitly asks for an approval state.
+  if (filter.status === 'PENDING' && !filter.approvalStatus) filter.approvalStatus = 'APPROVED';
   if (req.query.q) filter.$or = ['title', 'youtubeId', 'description'].map(k => ({ [k]: { $regex: String(req.query.q).slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } }));
   const [items, total] = await Promise.all([QueuedVideo.find(filter).sort(rankSort()).skip((page - 1) * limit).limit(limit).lean(), QueuedVideo.countDocuments(filter)]);
   res.json({ items, total, page, limit, pages: Math.ceil(total / limit) });
 } catch (e) { next(e); } });
-async function approval(req, res, next, status) { try { objectId(req.params.id); const item = await QueuedVideo.findByIdAndUpdate(req.params.id, { $set: { approvalStatus: status } }, { new: true }); if (!item) return res.status(404).json({ error: 'Video not found' }); res.json(item); } catch (e) { next(e); } }
+app.post('/api/queue/claim', async (req, res, next) => {
+  try {
+    const limit = req.body?.limit === undefined ? 50 : req.body.limit;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) return res.status(400).json({ error: 'limit must be an integer from 1 to 100' });
+    const candidates = await QueuedVideo.find({ status: 'PENDING', approvalStatus: 'APPROVED', $expr: { $lt: ['$retryCount', '$maxRetries'] } })
+      .sort(rankSort()).limit(limit).select('_id').lean();
+    const claimed = [];
+    for (const candidate of candidates) {
+      const item = await QueuedVideo.findOneAndUpdate(
+        { _id: candidate._id, status: 'PENDING', approvalStatus: 'APPROVED', $expr: { $lt: ['$retryCount', '$maxRetries'] } },
+        { $set: { status: 'PROCESSING' } }, { new: true }
+      ).lean();
+      if (item) claimed.push(item);
+    }
+    logger.info('queue_items_claimed', { claimed: claimed.length, requested: limit, approvalStatusRequired: 'APPROVED' });
+    res.json({ items: claimed, total: claimed.length });
+  } catch (e) { next(e); }
+});
+async function approval(req, res, next, status) { try { objectId(req.params.id); const update = status === 'APPROVED' ? { $set: { approvalStatus: status, status: 'PENDING' } } : { $set: { approvalStatus: status, status: 'AWAITING_APPROVAL' } }; const item = await QueuedVideo.findOneAndUpdate({ _id: req.params.id, status: { $in: ['AWAITING_APPROVAL', 'PENDING'] }, approvalStatus: { $ne: 'REJECTED' } }, update, { new: true }); if (!item) return res.status(409).json({ error: 'Video is missing, already rejected, or has already been claimed/sent; approval cannot be changed now' }); res.json(item); } catch (e) { next(e); } }
 app.post('/api/queue/:id/approve', (req, res, next) => approval(req, res, next, 'APPROVED'));
 app.post('/api/queue/:id/reject', (req, res, next) => approval(req, res, next, 'REJECTED'));
-app.post('/api/queue/bulk-approve', async (req, res, next) => { try { const ids = req.body?.ids; if (!Array.isArray(ids) || ids.length < 1 || ids.length > 500 || ids.some(id => !mongoose.isValidObjectId(id))) return res.status(400).json({ error: 'ids must contain 1 to 500 valid IDs' }); const result = await QueuedVideo.updateMany({ _id: { $in: ids }, approvalStatus: 'PENDING' }, { $set: { approvalStatus: 'APPROVED' } }); res.json({ modified: result.modifiedCount }); } catch (e) { next(e); } });
-app.post('/api/queue/:id/retry', async (req, res, next) => { try { objectId(req.params.id); const item = await QueuedVideo.findOneAndUpdate({ _id: req.params.id, status: 'FAILED', approvalStatus: { $ne: 'REJECTED' }, $expr: { $lt: ['$retryCount', '$maxRetries'] } }, { $set: { status: 'PENDING', lastError: '' } }, { new: true }); if (!item) return res.status(409).json({ error: 'Video is not eligible for retry' }); res.json(item); } catch (e) { next(e); } });
-app.post('/api/queue/:id/reset', async (req, res, next) => { try { objectId(req.params.id); const item = await QueuedVideo.findOneAndUpdate({ _id: req.params.id, status: 'FAILED', approvalStatus: { $ne: 'REJECTED' } }, { $set: { status: 'PENDING', retryCount: 0, lastError: '' } }, { new: true }); if (!item) return res.status(409).json({ error: 'Only non-rejected failed videos can be reset' }); res.json(item); } catch (e) { next(e); } });
-app.post('/api/queue/bulk-retry', async (req, res, next) => { try { const ids = req.body?.ids; if (ids !== undefined && (!Array.isArray(ids) || ids.length > 500 || ids.some(id => !mongoose.isValidObjectId(id)))) return res.status(400).json({ error: 'ids must contain at most 500 valid IDs' }); const filter = { status: 'FAILED', approvalStatus: { $ne: 'REJECTED' }, $expr: { $lt: ['$retryCount', '$maxRetries'] } }; if (ids) filter._id = { $in: ids }; const result = await QueuedVideo.updateMany(filter, { $set: { status: 'PENDING', lastError: '' } }); res.json({ modified: result.modifiedCount }); } catch (e) { next(e); } });
+app.post('/api/queue/bulk-approve', async (req, res, next) => { try { const ids = req.body?.ids; if (!Array.isArray(ids) || ids.length < 1 || ids.length > 500 || ids.some(id => !mongoose.isValidObjectId(id))) return res.status(400).json({ error: 'ids must contain 1 to 500 valid IDs' }); const result = await QueuedVideo.updateMany({ _id: { $in: ids }, approvalStatus: 'PENDING', status: { $in: ['AWAITING_APPROVAL', 'PENDING'] } }, { $set: { approvalStatus: 'APPROVED', status: 'PENDING' } }); res.json({ modified: result.modifiedCount }); } catch (e) { next(e); } });
+app.post('/api/queue/:id/retry', async (req, res, next) => { try { objectId(req.params.id); const base = { _id: req.params.id, status: 'FAILED', $expr: { $lt: ['$retryCount', '$maxRetries'] } }; let item = await QueuedVideo.findOneAndUpdate({ ...base, approvalStatus: 'APPROVED' }, { $set: { status: 'PENDING', lastError: '' } }, { new: true }); if (!item) item = await QueuedVideo.findOneAndUpdate({ ...base, approvalStatus: 'PENDING' }, { $set: { status: 'AWAITING_APPROVAL', lastError: '' } }, { new: true }); if (!item) return res.status(409).json({ error: 'Video is not eligible for retry' }); res.json(item); } catch (e) { next(e); } });
+app.post('/api/queue/:id/reset', async (req, res, next) => { try { objectId(req.params.id); const base = { _id: req.params.id, status: 'FAILED' }; let item = await QueuedVideo.findOneAndUpdate({ ...base, approvalStatus: 'APPROVED' }, { $set: { status: 'PENDING', retryCount: 0, lastError: '' } }, { new: true }); if (!item) item = await QueuedVideo.findOneAndUpdate({ ...base, approvalStatus: 'PENDING' }, { $set: { status: 'AWAITING_APPROVAL', retryCount: 0, lastError: '' } }, { new: true }); if (!item) return res.status(409).json({ error: 'Only non-rejected failed videos can be reset' }); res.json(item); } catch (e) { next(e); } });
+app.post('/api/queue/bulk-retry', async (req, res, next) => { try { const ids = req.body?.ids; if (ids !== undefined && (!Array.isArray(ids) || ids.length > 500 || ids.some(id => !mongoose.isValidObjectId(id)))) return res.status(400).json({ error: 'ids must contain at most 500 valid IDs' }); const base = { status: 'FAILED', $expr: { $lt: ['$retryCount', '$maxRetries'] } }; if (ids) base._id = { $in: ids }; const approved = await QueuedVideo.updateMany({ ...base, approvalStatus: 'APPROVED' }, { $set: { status: 'PENDING', lastError: '' } }); const pending = await QueuedVideo.updateMany({ ...base, approvalStatus: 'PENDING' }, { $set: { status: 'AWAITING_APPROVAL', lastError: '' } }); res.json({ modified: approved.modifiedCount + pending.modifiedCount }); } catch (e) { next(e); } });
 let scanPromise = null;
 app.post('/api/scan', async (_req, res, next) => { try { if (scanPromise) return res.status(409).json({ error: 'A full scan is already running' }); scanPromise = scanner.scanAll(); res.status(202).json({ message: 'Scan started' }); scanPromise.catch(e => console.error('[api] scan error:', e.message)).finally(() => { scanPromise = null; }); } catch (e) { next(e); } });
 app.post('/api/scan/:sourceId', async (req, res, next) => { try { objectId(req.params.sourceId); const result = await scanner.scanOne(req.params.sourceId); res.json(result); } catch (e) { next(e); } });
@@ -120,6 +141,8 @@ async function start() {
   logger.info('mongodb_connected');
   await Promise.all([Source.init(), QueuedVideo.init(), ScanHistory.init(), ScannerSettings.init()]);
   logger.info('mongodb_indexes_ready', { collections: ['sources', 'youtube_queue', 'scan_history', 'scanner_settings'] });
+  const approvalHoldback = await QueuedVideo.updateMany({ status: 'PENDING', approvalStatus: { $ne: 'APPROVED' } }, { $set: { status: 'AWAITING_APPROVAL' } });
+  if (approvalHoldback.modifiedCount) logger.warn('unapproved_queue_items_held_back', { movedToAwaitingApproval: approvalHoldback.modifiedCount });
   const port = Number(process.env.PORT || 3000);
   app.listen(port, '0.0.0.0', () => logger.info('server_listening', { port, trustedLanOnly: true }));
   await scheduler.startScheduler();
