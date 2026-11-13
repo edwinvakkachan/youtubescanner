@@ -182,9 +182,12 @@ async function scanSource(source) {
           const thumbnail = entry.thumbnail || (Array.isArray(entry.thumbnails) && entry.thumbnails.at(-1)?.url);
           try {
             if (!thumbnail) throw new Error('No thumbnail URL in video metadata');
+            logger.gemini('REQUEST', { model: 'gemini-3.1-flash-lite', sourceId: sourceKey, sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180) });
             const thumbnailText = await thumbnailTextFromUrl(thumbnail);
             result = findMatches(source, entry, description, thumbnailText);
+            logger.gemini(result.accepted ? 'ACCEPTED' : 'REJECTED', { model: 'gemini-3.1-flash-lite', sourceId: sourceKey, sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), extractedText: thumbnailText, matchedKeywords: result.matches, matchMode: source.matchMode || 'ANY' });
           } catch (err) {
+            logger.gemini('ERROR', { model: 'gemini-3.1-flash-lite', sourceId: sourceKey, sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), message: err.message });
             if (!geminiWarned) {
               logger.warn('thumbnail_gemini_failed', { sourceId: sourceKey, sourceName: source.name, message: err.message, hint: 'Metadata matching will continue; verify GEMINI_API_KEY and Gemini API access.' });
               geminiWarned = true;
