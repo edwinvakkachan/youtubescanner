@@ -4,6 +4,7 @@ const { spawn } = require('node:child_process');
 const readline = require('node:readline');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 const { connectDB } = require('./db');
 const { Source, QueuedVideo, ScanHistory } = require('./models');
 const logger = require('./logger');
@@ -90,6 +91,43 @@ async function thumbnailTextFromUrl(url) {
   if (text === undefined) throw new Error('Gemini returned no thumbnail text');
   return text;
 }
+async function scanNewGeminiThumbnails(source, entries) {
+  const results = new Map();
+  const cursor = source.geminiLastScannedVideoId || '';
+  const cursorIndex = cursor ? entries.findIndex(entry => videoId(entry) === cursor) : -1;
+  let candidates; let skippedEntries = [];
+  if (source.type === 'playlist') {
+    candidates = cursorIndex >= 0 ? entries.slice(cursorIndex + 1) : entries.slice();
+    skippedEntries = cursorIndex >= 0 ? entries.slice(0, cursorIndex + 1) : [];
+  } else {
+    candidates = cursorIndex >= 0 ? entries.slice(0, cursorIndex).reverse() : entries.slice().reverse();
+    skippedEntries = cursorIndex >= 0 ? entries.slice(cursorIndex) : [];
+  }
+  const skippedIds = new Set(skippedEntries.map(videoId).filter(Boolean));
+  let attempted = 0; let error = null;
+  for (const entry of candidates) {
+    const id = videoId(entry);
+    if (!id) continue;
+    const thumbnail = entry.thumbnail || (Array.isArray(entry.thumbnails) && entry.thumbnails.at(-1)?.url);
+    try {
+      if (!thumbnail) throw new Error('No thumbnail URL in video metadata');
+      attempted++;
+      logger.gemini('REQUEST', { model: 'gemini-3.1-flash-lite', sourceId: String(source._id), sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180) });
+      const text = await thumbnailTextFromUrl(thumbnail);
+      const match = findMatches(source, entry, entry.description || '', text);
+      if (match.accepted) await upsertVideo(source, entry, match.matches);
+      await Source.updateOne({ _id: source._id }, { $set: { geminiLastScannedVideoId: id } });
+      source.geminiLastScannedVideoId = id;
+      results.set(id, { accepted: match.accepted, matches: match.matches, text });
+      logger.gemini(match.accepted ? 'ACCEPTED' : 'REJECTED', { model: 'gemini-3.1-flash-lite', sourceId: String(source._id), sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), extractedText: text, matchedKeywords: match.matches, matchMode: source.matchMode || 'ANY' });
+    } catch (err) {
+      error = { youtubeId: id, message: err.message };
+      logger.gemini('ERROR', { model: 'gemini-3.1-flash-lite', sourceId: String(source._id), sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), message: err.message });
+      break;
+    }
+  }
+  return { results, skippedIds, attempted, error };
+}
 function xmlEscape(value) {
   return String(value ?? '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
@@ -157,8 +195,9 @@ async function upsertVideo(source, entry, matches) {
 async function scanSource(source) {
   const sourceKey = String(source._id);
   if (activeSources.has(sourceKey)) return { skipped: true, reason: 'source scan already running' };
+  const lockToken = randomUUID();
   const lockUntil = new Date(Date.now() + 6 * 60 * 1000);
-  const lock = await Source.findOneAndUpdate({ _id: source._id, $or: [{ scanLockUntil: null }, { scanLockUntil: { $lt: new Date() } }] }, { $set: { scanLockUntil: lockUntil } }, { new: true, select: '+scanLockUntil' });
+  const lock = await Source.findOneAndUpdate({ _id: source._id, $or: [{ scanLockUntil: null }, { scanLockUntil: { $lt: new Date() } }] }, { $set: { scanLockUntil: lockUntil, scanLockToken: lockToken } }, { new: true, select: '+scanLockUntil +scanLockToken' });
   if (!lock) {
     logger.warn('source_scan_skipped_locked', { sourceId: sourceKey, sourceName: source.name });
     return { sourceId: sourceKey, skipped: true, reason: 'source scan already running' };
@@ -167,39 +206,33 @@ async function scanSource(source) {
   const startedAt = new Date();
   const history = await ScanHistory.create({ sourceId: source._id, sourceName: source.name, sourceType: source.type, startedAt });
   const limit = Number.isInteger(source.videosPerScan) ? Math.min(10000, Math.max(1, source.videosPerScan)) : LIMIT;
-  let inspected = 0, matched = 0, rejected = 0, geminiAttempted = 0, geminiWarned = false; const errors = [];
+  let inspected = 0, matched = 0, rejected = 0, geminiAttempted = 0; const errors = [];
+  const lockHeartbeat = setInterval(() => {
+    Source.updateOne({ _id: source._id, scanLockToken: lockToken }, { $set: { scanLockUntil: new Date(Date.now() + 6 * 60 * 1000) } })
+      .catch(err => logger.warn('source_scan_lock_heartbeat_failed', { sourceId: sourceKey, sourceName: source.name, message: err.message }));
+  }, 60_000);
   logger.info('source_scan_started', { sourceId: sourceKey, sourceName: source.name, sourceType: source.type, maxEntries: limit, scanDescription: source.scanDescription !== false, generateNfo: source.generateNfo === true, thumbnailGeminiEnabled: source.thumbnailGeminiEnabled === true });
   try {
     const entries = await runYtDlp(source, limit);
+    let geminiResults = { results: new Map(), skippedIds: new Set(), attempted: 0, error: null };
+    if (source.thumbnailGeminiEnabled === true) {
+      geminiResults = await scanNewGeminiThumbnails(source, entries.slice(0, limit));
+      geminiAttempted = geminiResults.attempted;
+      if (geminiResults.error) logger.warn('thumbnail_gemini_failed', { sourceId: sourceKey, sourceName: source.name, youtubeId: geminiResults.error.youtubeId, message: geminiResults.error.message, hint: 'The Gemini cursor remains before this video; verify GEMINI_API_KEY and Gemini API access.' });
+    }
     for (const entry of entries.slice(0, limit)) {
       const id = videoId(entry); if (!id) continue;
       inspected++;
+      if (geminiResults.skippedIds.has(id)) continue;
       try {
         const description = source.generateNfo === true ? await descriptionFromNfo(source, entry, id) : (entry.description || '');
-        let result = findMatches(source, entry, description);
-        if (source.thumbnailGeminiEnabled === true) {
-          geminiAttempted++;
-          const thumbnail = entry.thumbnail || (Array.isArray(entry.thumbnails) && entry.thumbnails.at(-1)?.url);
-          try {
-            if (!thumbnail) throw new Error('No thumbnail URL in video metadata');
-            logger.gemini('REQUEST', { model: 'gemini-3.1-flash-lite', sourceId: sourceKey, sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180) });
-            const thumbnailText = await thumbnailTextFromUrl(thumbnail);
-            result = findMatches(source, entry, description, thumbnailText);
-            logger.gemini(result.accepted ? 'ACCEPTED' : 'REJECTED', { model: 'gemini-3.1-flash-lite', sourceId: sourceKey, sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), extractedText: thumbnailText, matchedKeywords: result.matches, matchMode: source.matchMode || 'ANY' });
-          } catch (err) {
-            logger.gemini('ERROR', { model: 'gemini-3.1-flash-lite', sourceId: sourceKey, sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), message: err.message });
-            if (!geminiWarned) {
-              logger.warn('thumbnail_gemini_failed', { sourceId: sourceKey, sourceName: source.name, message: err.message, hint: 'Metadata matching will continue; verify GEMINI_API_KEY and Gemini API access.' });
-              geminiWarned = true;
-            }
-          }
-        }
+        const result = geminiResults.results.get(id) || findMatches(source, entry, description);
         if (!result.accepted) {
           rejected++;
           logger.debug('video_rejected_by_keywords', { sourceId: sourceKey, youtubeId: id, descriptionChecked: source.scanDescription !== false, nfoUsed: source.generateNfo === true });
           continue;
         }
-        await upsertVideo(source, entry, result.matches);
+        if (!geminiResults.results.has(id)) await upsertVideo(source, entry, result.matches);
         matched++;
         logger.debug('video_queued_or_refreshed', { sourceId: sourceKey, youtubeId: id, matchedKeywords: result.matches, descriptionChecked: source.scanDescription !== false, nfoUsed: source.generateNfo === true });
       } catch (err) {
@@ -210,7 +243,7 @@ async function scanSource(source) {
     const completedAt = new Date();
     await Source.updateOne({ _id: source._id }, { $set: { lastScannedAt: completedAt } });
     await ScanHistory.updateOne({ _id: history._id }, { $set: { completedAt, inspected, matched, rejected, errorCount: errors.length, errorDetails: errors, status: errors.length ? (inspected ? 'PARTIAL' : 'FAILED') : 'COMPLETED' } });
-    logger.info('source_scan_completed', { sourceId: sourceKey, sourceName: source.name, status: errors.length ? (inspected ? 'PARTIAL' : 'FAILED') : 'COMPLETED', inspected, matched, rejected, thumbnailGeminiAttempted: geminiAttempted, errors: errors.length, durationMs: completedAt.getTime() - startedAt.getTime() });
+    logger.info('source_scan_completed', { sourceId: sourceKey, sourceName: source.name, status: errors.length ? (inspected ? 'PARTIAL' : 'FAILED') : 'COMPLETED', inspected, matched, rejected, thumbnailGeminiAttempted: geminiAttempted, thumbnailGeminiSkipped: geminiResults.skippedIds.size, geminiLastScannedVideoId: source.geminiLastScannedVideoId || null, errors: errors.length, durationMs: completedAt.getTime() - startedAt.getTime() });
     return { sourceId: sourceKey, inspected, matched, rejected, errors: errors.length };
   } catch (err) {
     errors.push(err.message);
@@ -221,8 +254,9 @@ async function scanSource(source) {
     logger.error('source_scan_failed', { sourceId: sourceKey, sourceName: source.name, inspected, matched, rejected, message: err.message, hint: message, durationMs: completedAt.getTime() - startedAt.getTime() });
     return { sourceId: sourceKey, inspected, matched, rejected, errors: errors.length, error: message };
   } finally {
+    clearInterval(lockHeartbeat);
     activeSources.delete(sourceKey);
-    await Source.updateOne({ _id: source._id }, { $set: { scanLockUntil: null } }).catch(() => {});
+    await Source.updateOne({ _id: source._id, scanLockToken: lockToken }, { $set: { scanLockUntil: null, scanLockToken: null } }).catch(() => {});
   }
 }
 async function scanAll() {

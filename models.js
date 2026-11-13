@@ -10,6 +10,7 @@ const sourceSchema = new Schema({
   videosPerScan: { type: Number, default: defaultVideosPerScan, min: 1, max: 10000 },
   scanDescription: { type: Boolean, default: true },
   thumbnailGeminiEnabled: { type: Boolean, default: false },
+  geminiLastScannedVideoId: { type: String, default: '' },
   generateNfo: { type: Boolean, default: false },
   keywords: { type: [String], default: [] },
   excludeKeywords: { type: [String], default: [] },
@@ -18,7 +19,8 @@ const sourceSchema = new Schema({
   autoApproveVideos: { type: Boolean, default: false },
   enabled: { type: Boolean, default: true },
   lastScannedAt: { type: Date, default: null },
-  scanLockUntil: { type: Date, default: null, select: false }
+  scanLockUntil: { type: Date, default: null, select: false },
+  scanLockToken: { type: String, default: null, select: false }
 }, { timestamps: true });
 sourceSchema.index({ url: 1 }, { unique: true });
 
