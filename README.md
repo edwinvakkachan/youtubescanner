@@ -141,3 +141,7 @@ In Portainer, set `NFO_HOST_PATH` to a writable directory on the Docker host. Co
 Application logs are structured JSON with ISO timestamps and are written to stdout/stderr, so they are visible with `docker compose logs -f --tail 200 app`. The default Docker `LOG_LEVEL=debug` includes per-video match/rejection records, scan counts and duration, API request status, startup/index status, and errors. Set `LOG_LEVEL=info` in `.env` to reduce per-video detail. Docker retains rotated logs using the configured `json-file` logging driver (three 10 MB files).
 
 The Docker dashboard has no authentication; restrict the published port to a trusted LAN.
+
+### Thumbnail OCR
+
+Enable **Scan thumbnails with Tesseract OCR** for individual sources. OCR runs sequentially only when title/description keyword matching did not accept a video, so it can discover words visible in thumbnails without OCR-ing every item. Each source scan processes at most 20 thumbnails by default; set `THUMBNAIL_OCR_MAX_PER_SCAN` to a value from 1 to 100 to change the cap. Each image is limited to 512 KB, downloads time out after 5 seconds, and each Tesseract process is limited to 8 seconds and one OpenMP thread. OCR failures fall back to normal metadata matching and do not stop the scan. The Docker image installs Tesseract and English language data; for direct installs, install those system packages or set `TESSERACT_PATH` and `TESSERACT_LANG` (default `eng`).

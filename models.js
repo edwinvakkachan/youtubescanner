@@ -9,6 +9,7 @@ const sourceSchema = new Schema({
   type: { type: String, required: true, enum: ['channel', 'playlist', 'shorts'] },
   videosPerScan: { type: Number, default: defaultVideosPerScan, min: 1, max: 10000 },
   scanDescription: { type: Boolean, default: true },
+  thumbnailOcrEnabled: { type: Boolean, default: false },
   generateNfo: { type: Boolean, default: false },
   keywords: { type: [String], default: [] },
   excludeKeywords: { type: [String], default: [] },

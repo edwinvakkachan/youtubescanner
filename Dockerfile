@@ -8,7 +8,7 @@ WORKDIR /app
 # Install yt-dlp in an isolated Python environment. The Python package provides
 # ARM64-compatible wheels/releases through pip and does not require video codecs
 # for metadata-only extraction.
-RUN apk add --no-cache python3 py3-pip py3-virtualenv \
+RUN apk add --no-cache python3 py3-pip py3-virtualenv tesseract-ocr tesseract-ocr-data-eng \
     && python3 -m virtualenv /opt/yt-dlp \
     && /opt/yt-dlp/bin/pip install --no-cache-dir --upgrade pip yt-dlp
 

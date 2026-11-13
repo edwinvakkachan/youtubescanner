@@ -33,7 +33,7 @@ function cleanKeywords(value) {
 function sourceInput(body, partial = false) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw Object.assign(new Error('JSON object required'), { status: 400 });
   const out = {};
-  for (const key of ['name', 'url', 'type', 'matchMode', 'priority', 'enabled', 'autoApproveVideos', 'videosPerScan', 'scanDescription', 'generateNfo', 'keywords', 'excludeKeywords']) {
+  for (const key of ['name', 'url', 'type', 'matchMode', 'priority', 'enabled', 'autoApproveVideos', 'videosPerScan', 'scanDescription', 'generateNfo', 'thumbnailOcrEnabled', 'keywords', 'excludeKeywords']) {
     if (!(key in body)) continue;
     const value = body[key];
     if (key === 'name') { if (typeof value !== 'string' || !value.trim() || value.length > 160) throw Object.assign(new Error('Name is required (max 160 chars)'), { status: 400 }); out.name = value.trim(); }
@@ -44,7 +44,7 @@ function sourceInput(body, partial = false) {
     else if (key === 'enabled') { if (typeof value !== 'boolean') throw Object.assign(new Error('enabled must be boolean'), { status: 400 }); out.enabled = value; }
     else if (key === 'autoApproveVideos') { if (typeof value !== 'boolean') throw Object.assign(new Error('autoApproveVideos must be boolean'), { status: 400 }); out.autoApproveVideos = value; }
     else if (key === 'videosPerScan') { if (!Number.isInteger(value) || value < 1 || value > 10000) throw Object.assign(new Error('videosPerScan must be an integer from 1 to 10000'), { status: 400 }); out.videosPerScan = value; }
-    else if (key === 'scanDescription' || key === 'generateNfo') { if (typeof value !== 'boolean') throw Object.assign(new Error(`${key} must be boolean`), { status: 400 }); out[key] = value; }
+    else if (key === 'scanDescription' || key === 'generateNfo' || key === 'thumbnailOcrEnabled') { if (typeof value !== 'boolean') throw Object.assign(new Error(`${key} must be boolean`), { status: 400 }); out[key] = value; }
     else out[key] = cleanKeywords(value);
   }
   if (out.type && out.type !== 'channel' && out.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 });
