@@ -54,6 +54,17 @@ function sourceInput(body, partial = false) {
 }
 function objectId(value) { if (!mongoose.isValidObjectId(value)) throw Object.assign(new Error('Invalid id'), { status: 400 }); }
 function rankSort() { return { priorityRank: 1, discoveredAt: 1 }; }
+function requestedSort(req, allowed, fallback) {
+  const field = String(req.query.sort || '');
+  const order = String(req.query.order || 'asc');
+  if (!field) return fallback;
+  if (!Object.hasOwn(allowed, field) || !['asc', 'desc'].includes(order)) return null;
+  const direction = order === 'asc' ? 1 : -1;
+  const result = { [allowed[field]]: direction };
+  if (field === 'priorityRank') result.discoveredAt = 1;
+  result._id = -1;
+  return result;
+}
 app.get('/api/health', (_req, res) => res.json({ ok: true, database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 app.get('/api/sources', async (_req, res, next) => { try { res.json(await Source.find().sort({ type: 1, name: 1 }).lean()); } catch (e) { next(e); } });
 app.post('/api/sources', async (req, res, next) => { try { res.status(201).json(await Source.create(sourceInput(req.body))); } catch (e) { next(e); } });
@@ -71,7 +82,9 @@ app.get('/api/queue', async (req, res, next) => { try {
   // or rejected approvals unless the caller explicitly asks for an approval state.
   if (filter.status === 'PENDING' && !filter.approvalStatus) filter.approvalStatus = 'APPROVED';
   if (req.query.q) filter.$or = ['title', 'youtubeId', 'description'].map(k => ({ [k]: { $regex: String(req.query.q).slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } }));
-  const [items, total] = await Promise.all([QueuedVideo.find(filter).sort(rankSort()).skip((page - 1) * limit).limit(limit).lean(), QueuedVideo.countDocuments(filter)]);
+  const sort = requestedSort(req, { discoveredAt: 'discoveredAt', title: 'title', priorityRank: 'priorityRank', duration: 'duration', status: 'status' }, rankSort());
+  if (!sort) return res.status(400).json({ error: 'Invalid queue sort or order' });
+  const [items, total] = await Promise.all([QueuedVideo.find(filter).sort(sort).skip((page - 1) * limit).limit(limit).lean(), QueuedVideo.countDocuments(filter)]);
   res.json({ items, total, page, limit, pages: Math.ceil(total / limit) });
 } catch (e) { next(e); } });
 app.post('/api/queue/claim', async (req, res, next) => {
@@ -102,7 +115,7 @@ app.post('/api/queue/bulk-retry', async (req, res, next) => { try { const ids = 
 let scanPromise = null;
 app.post('/api/scan', async (_req, res, next) => { try { if (scanPromise) return res.status(409).json({ error: 'A full scan is already running' }); scanPromise = scanner.scanAll(); res.status(202).json({ message: 'Scan started' }); scanPromise.catch(e => console.error('[api] scan error:', e.message)).finally(() => { scanPromise = null; }); } catch (e) { next(e); } });
 app.post('/api/scan/:sourceId', async (req, res, next) => { try { objectId(req.params.sourceId); const result = await scanner.scanOne(req.params.sourceId); res.json(result); } catch (e) { next(e); } });
-app.get('/api/scan-history', async (req, res, next) => { try { const page = Math.max(1, Number.parseInt(req.query.page || '1', 10) || 1); const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit || '50', 10) || 50)); const [items, total] = await Promise.all([ScanHistory.find().sort({ startedAt: -1 }).skip((page - 1) * limit).limit(limit).lean(), ScanHistory.countDocuments()]); res.json({ items, total, page, limit }); } catch (e) { next(e); } });
+app.get('/api/scan-history', async (req, res, next) => { try { const page = Math.max(1, Number.parseInt(req.query.page || '1', 10) || 1); const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit || '50', 10) || 50)); const sort = requestedSort(req, { startedAt: 'startedAt', sourceName: 'sourceName', matched: 'matched', errors: 'errorCount' }, { startedAt: -1 }); if (!sort) return res.status(400).json({ error: 'Invalid scan history sort or order' }); const [items, total] = await Promise.all([ScanHistory.find().sort(sort).skip((page - 1) * limit).limit(limit).lean(), ScanHistory.countDocuments()]); res.json({ items, total, page, limit }); } catch (e) { next(e); } });
 app.get('/api/scan-history/:sourceId', async (req, res, next) => { try { objectId(req.params.sourceId); res.json(await ScanHistory.find({ sourceId: req.params.sourceId }).sort({ startedAt: -1 }).limit(100).lean()); } catch (e) { next(e); } });
 app.get('/api/settings/scan', async (_req, res, next) => {
   try {

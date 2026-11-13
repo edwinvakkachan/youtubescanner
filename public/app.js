@@ -1,6 +1,6 @@
 'use strict';
 const $ = s => document.querySelector(s);
-const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', timer: null };
+const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', timer: null, sorts: {} };
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
 async function api(url, options = {}) {
   const response = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options });
@@ -15,6 +15,9 @@ function videoRows(items, actions = 'approval') {
   return `<div class="tablewrap"><table><thead><tr><th>Video</th><th>Priority</th><th>Approval</th><th>Import status</th><th>Discovered</th><th>Actions</th></tr></thead><tbody>${items.map(v => `<tr><td><div class="videocell"><img class="thumb" src="${escapeHtml(v.thumbnail || '')}" onerror="this.style.visibility='hidden'" alt=""><div><a class="title" href="${escapeHtml(v.url)}" target="_blank" rel="noopener">${escapeHtml(v.title || v.youtubeId)}</a><div class="sub">${escapeHtml(v.youtubeId)} · ${v.duration ? `${Math.floor(v.duration / 60)} min` : 'duration n/a'}</div></div></div></td><td>${badge(v.priority)}</td><td>${badge(v.approvalStatus)}</td><td>${badge(v.status)}${v.status === 'SENT' && v.approvalStatus !== 'APPROVED' ? '<div class="sub">Already sent before approval; remove manually from TubeArchivist.</div>' : ''}${v.lastError ? `<div class="sub" title="${escapeHtml(v.lastError)}">${escapeHtml(v.lastError.slice(0, 48))}</div>` : ''}</td><td>${v.discoveredAt ? new Date(v.discoveredAt).toLocaleDateString() : '—'}</td><td><div class="actions">${actions === 'approval' && v.approvalStatus === 'PENDING' && ['PENDING', 'AWAITING_APPROVAL'].includes(v.status) ? `<button class="smallbtn" data-act="approve" data-id="${v._id}">Approve</button><button class="smallbtn" data-act="reject" data-id="${v._id}">Reject</button>` : ''}${actions === 'failed' && v.status === 'FAILED' ? `<button class="smallbtn" data-act="retry" data-id="${v._id}">Retry</button><button class="smallbtn" data-act="reset" data-id="${v._id}">Reset</button>` : ''}</div></td></tr>`).join('')}</tbody></table></div>`;
 }
 function paging(data) { return `<div class="pagination"><span>${data.total} videos · page ${data.page} of ${Math.max(1, Math.ceil(data.total / data.limit))}</span><button class="smallbtn" data-page="${data.page - 1}" ${data.page <= 1 ? 'disabled' : ''}>Previous</button><button class="smallbtn" data-page="${data.page + 1}" ${data.page >= Math.ceil(data.total / data.limit) ? 'disabled' : ''}>Next</button></div>`; }
+const queueSorts = [['discoveredAt:desc','Newest discovered'],['discoveredAt:asc','Oldest discovered'],['title:asc','Title A–Z'],['title:desc','Title Z–A'],['priorityRank:asc','Priority: high first'],['duration:desc','Duration: longest first'],['duration:asc','Duration: shortest first'],['status:asc','Import status A–Z']];
+const historySorts = [['startedAt:desc','Newest scan'],['startedAt:asc','Oldest scan'],['sourceName:asc','Source A–Z'],['sourceName:desc','Source Z–A'],['matched:desc','Most matches'],['matched:asc','Fewest matches'],['errors:desc','Most errors'],['errors:asc','Fewest errors']];
+function sortControl(options, fallback) { const selected = state.sorts[state.view] || fallback; return `<label class="sort-control">Sort by <select data-sort>${options.map(([value,label]) => `<option value="${value}" ${value === selected ? 'selected' : ''}>${label}</option>`).join('')}</select></label>`; }
 async function stats() {
   const d = await api('/api/stats');
   const cards = [['Configured sources', d.sources, 'Across all source types'], ['Videos discovered', d.total, 'Unique YouTube IDs'], ['Pending approval', d.pendingApproval, 'Awaiting a decision'], ['Approved videos', d.approved, 'Ready for importer'], ['Pending imports', d.pendingImports, 'Approved and waiting'], ['Processed / failed', `${d.processed} / ${d.failed}`, 'Completed / needs retry']];
@@ -44,20 +47,25 @@ const views = {
 };
 async function renderQueue(view) {
   const [title, subtitle, filters] = views[view];
-  const qs = new URLSearchParams({ page: String(state.page), limit: String(state.limit), ...filters });
+  const defaultSort = view === 'queue' ? 'priorityRank:asc' : 'discoveredAt:desc';
+  const selectedSort = state.sorts[view] || defaultSort;
+  const [sort, order] = selectedSort.split(':');
+  const qs = new URLSearchParams({ page: String(state.page), limit: String(state.limit), sort, order, ...filters });
   const data = await api(`/api/queue?${qs}`);
   const action = view === 'failed' ? 'failed' : (view === 'approval' ? 'approval' : 'none');
   const bulk = view === 'approval' ? '<button class="button" id="bulkApprove">Approve all on this page</button>' : '';
-  $('#content').innerHTML = `${shell(title, subtitle, bulk)}${videoRows(data.items, action)}${paging(data)}</div>`;
+  $('#content').innerHTML = `${shell(title, subtitle, `${sortControl(queueSorts, defaultSort)}${bulk}`)}${videoRows(data.items, action)}${paging(data)}</div>`;
 }
 async function renderKeywords() {
   const sources = await api('/api/sources');
   $('#content').innerHTML = `${shell('Keyword management', 'Edit include and exclusion words per source', '<select id="keywordSource"><option value="">Choose a source</option>' + sources.map(s => `<option value="${s._id}">${escapeHtml(s.name)} · ${s.type}</option>`).join('') + '</select>')}<div id="keywordEditor" class="empty">Select a source to edit its keyword rules.</div></div>`;
 }
 async function renderHistory() {
-  const d = await api(`/api/scan-history?page=${state.page}&limit=${state.limit}`);
+  const selectedSort = state.sorts.history || 'startedAt:desc';
+  const [sort, order] = selectedSort.split(':');
+  const d = await api(`/api/scan-history?page=${state.page}&limit=${state.limit}&sort=${sort}&order=${order}`);
   const body = d.items.length ? `<div class="tablewrap"><table><thead><tr><th>Source</th><th>Status</th><th>Started</th><th>Completed</th><th>Inspected</th><th>Matched</th><th>Rejected</th><th>Errors</th></tr></thead><tbody>${d.items.map(x => `<tr><td><b>${escapeHtml(x.sourceName)}</b><div class="sub">${escapeHtml(x.sourceType)}</div></td><td>${badge(x.status)}</td><td>${x.startedAt ? new Date(x.startedAt).toLocaleString() : '—'}</td><td>${x.completedAt ? new Date(x.completedAt).toLocaleString() : '—'}</td><td>${x.inspected}</td><td>${x.matched}</td><td>${x.rejected}</td><td>${x.errorCount ?? x.errors ?? 0}${x.errorDetails?.length ? `<div class="sub historydetails" title="${escapeHtml(x.errorDetails.join('\n'))}">${escapeHtml(x.errorDetails[0])}</div>` : ''}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No scans have run.</div>';
-  $('#content').innerHTML = `${shell('Scan history', 'Recorded source scans and extraction errors')}${body}${paging(d)}</div>`;
+  $('#content').innerHTML = `${shell('Scan history', 'Recorded source scans and extraction errors', sortControl(historySorts, 'startedAt:desc'))}${body}${paging(d)}</div>`;
 }
 async function render() {
   state.page = Math.max(1, state.page);
@@ -107,6 +115,7 @@ $('#content').addEventListener('click', async e => {
     await render();
   } catch (err) { toast(err.message, true); }
 });
+$('#content').addEventListener('change', e => { if (!e.target.matches('[data-sort]')) return; state.sorts[state.view] = e.target.value; state.page = 1; render().catch(err => toast(err.message, true)); });
 $('#content').addEventListener('change', async e => { if (e.target.id === 'keywordSource') { try { const sources = await api('/api/sources'); const source = sources.find(s => s._id === e.target.value); if (source) await fillKeywords(source); } catch (err) { toast(err.message, true); } } });
 $('#sourceForm').addEventListener('submit', async e => { e.preventDefault(); const f = e.currentTarget; const body = { name: f.elements.name.value.trim(), url: f.elements.url.value.trim(), type: f.elements.type.value, priority: f.elements.priority.value, matchMode: f.elements.matchMode.value, enabled: f.elements.enabled.checked, videosPerScan: Number(f.elements.videosPerScan.value), scanDescription: f.elements.scanDescription.checked || f.elements.generateNfo.checked, generateNfo: f.elements.generateNfo.checked, autoApproveVideos: f.elements.type.value === 'channel' && f.elements.autoApproveVideos.checked, keywords: splitWords(f.elements.keywords.value), excludeKeywords: splitWords(f.elements.excludeKeywords.value) }; try { const id = f.elements.id.value; await api(id ? `/api/sources/${id}` : '/api/sources', { method: id ? 'PUT' : 'POST', body: JSON.stringify(body) }); $('#sourceDialog').close(); toast(id ? 'Source updated' : 'Source added'); await render(); } catch (err) { toast(err.message, true); } });
 $('#content').addEventListener('submit', async e => {
