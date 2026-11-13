@@ -9,6 +9,7 @@ services:
       MONGODB_URI: ${MONGODB_URI:?Set MONGODB_URI in the Compose or Portainer stack environment}
       YT_DLP_PATH: /opt/yt-dlp/bin/yt-dlp
       LOG_LEVEL: ${LOG_LEVEL:-debug}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       NFO_DIRECTORY: /nfo
     ports:
       - "${PORT:-3000}:${PORT:-3000}"

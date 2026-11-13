@@ -4,7 +4,6 @@ const { spawn } = require('node:child_process');
 const readline = require('node:readline');
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const os = require('node:os');
 const { connectDB } = require('./db');
 const { Source, QueuedVideo, ScanHistory } = require('./models');
 const logger = require('./logger');
@@ -14,10 +13,6 @@ const MAX_RETRIES = Math.max(1, Number.parseInt(process.env.MAX_RETRIES || '3', 
 const PRIORITY_RANK = { HIGH: 1, NORMAL: 2, LOW: 3 };
 let activeAll = false;
 const activeSources = new Set();
-const MAX_THUMBNAIL_BYTES = 512 * 1024;
-const THUMBNAIL_OCR_TIMEOUT_MS = 8000;
-const MAX_OCR_PER_SCAN = Math.min(100, Math.max(1, Number.parseInt(process.env.THUMBNAIL_OCR_MAX_PER_SCAN || '20', 10) || 20));
-let ocrQueue = Promise.resolve();
 
 function runYtDlp(source, limit) {
   return new Promise((resolve, reject) => {
@@ -68,55 +63,32 @@ function findMatches(source, entry, description = entry.description || '', thumb
   const matches = includes.filter(k => text.includes(k.toLocaleLowerCase()));
   return { accepted: source.matchMode === 'ALL' ? matches.length === includes.length : matches.length > 0, matches };
 }
-function runTesseract(filePath) {
-  const task = () => new Promise((resolve, reject) => {
-    const executable = process.env.TESSERACT_PATH || 'tesseract';
-    const child = spawn(executable, [filePath, 'stdout', '-l', process.env.TESSERACT_LANG || 'eng', '--psm', '11'], {
-      windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, OMP_THREAD_LIMIT: '1' }
-    });
-    let output = ''; let stderr = ''; let settled = false;
-    const timer = setTimeout(() => { child.kill('SIGKILL'); if (!settled) { settled = true; reject(new Error('Tesseract OCR timed out')); } }, THUMBNAIL_OCR_TIMEOUT_MS);
-    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
-    child.stdout.on('data', chunk => { output += chunk; if (output.length > 20000) child.kill('SIGKILL'); });
-    child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-1000); });
-    child.on('error', err => { if (!settled) { settled = true; clearTimeout(timer); reject(err); } });
-    child.on('close', code => {
-      clearTimeout(timer);
-      if (settled) return;
-      settled = true;
-      if (code !== 0) return reject(new Error(stderr.trim() || `Tesseract exited with code ${code}`));
-      resolve(output.slice(0, 20000));
-    });
-  });
-  const result = ocrQueue.then(task);
-  ocrQueue = result.catch(() => {});
-  return result;
-}
 async function thumbnailTextFromUrl(url) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not configured');
   const parsed = new URL(url);
   if (parsed.protocol !== 'https:' || !(parsed.hostname === 'i.ytimg.com' || parsed.hostname.endsWith('.googleusercontent.com'))) throw new Error('Thumbnail host is not allowed');
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000);
-  try {
-    const response = await fetch(parsed, { signal: controller.signal, redirect: 'error' });
-    if (!response.ok) throw new Error(`Thumbnail request returned HTTP ${response.status}`);
-    const contentType = (response.headers.get('content-type') || '').split(';')[0].toLowerCase();
-    if (!['image/jpeg', 'image/png'].includes(contentType)) throw new Error(`Unsupported thumbnail format: ${contentType || 'unknown'}`);
-    const declaredLength = Number(response.headers.get('content-length') || 0);
-    if (declaredLength > MAX_THUMBNAIL_BYTES) throw new Error('Thumbnail exceeds the 512 KB size limit');
-    const chunks = []; let size = 0;
-    for await (const chunk of response.body) {
-      size += chunk.length;
-      if (size > MAX_THUMBNAIL_BYTES) throw new Error('Thumbnail exceeds the 512 KB size limit');
-      chunks.push(chunk);
-    }
-    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'youtube-thumb-ocr-'));
-    const filePath = path.join(directory, contentType === 'image/png' ? 'thumbnail.png' : 'thumbnail.jpg');
-    try {
-      await fs.writeFile(filePath, Buffer.concat(chunks, size), { mode: 0o600 });
-      return await runTesseract(filePath);
-    } finally { await fs.rm(directory, { recursive: true, force: true }); }
-  } finally { clearTimeout(timer); }
+  const response = await fetch(parsed, { redirect: 'follow' });
+  if (!response.ok) throw new Error(`Thumbnail request returned HTTP ${response.status}`);
+  const finalUrl = new URL(response.url);
+  if (finalUrl.protocol !== 'https:' || !(finalUrl.hostname === 'i.ytimg.com' || finalUrl.hostname.endsWith('.googleusercontent.com'))) throw new Error('Thumbnail redirect host is not allowed');
+  const mimeType = (response.headers.get('content-type') || '').split(';')[0].toLowerCase();
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(mimeType)) throw new Error(`Unsupported thumbnail format: ${mimeType || 'unknown'}`);
+  const image = Buffer.from(await response.arrayBuffer());
+  const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent';
+  const result = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+    body: JSON.stringify({ contents: [{ parts: [
+      { text: 'Read and transcribe every word visible in this YouTube thumbnail. Preserve the original scripts and wording. Return only the visible text, without explanation.' },
+      { inline_data: { mime_type: mimeType, data: image.toString('base64') } }
+    ] }] })
+  });
+  const payload = await result.json().catch(() => ({}));
+  if (!result.ok) throw new Error(payload.error?.message || `Gemini API returned HTTP ${result.status}`);
+  const text = payload.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('\n').trim();
+  if (text === undefined) throw new Error('Gemini returned no thumbnail text');
+  return text;
 }
 function xmlEscape(value) {
   return String(value ?? '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '')
@@ -195,8 +167,8 @@ async function scanSource(source) {
   const startedAt = new Date();
   const history = await ScanHistory.create({ sourceId: source._id, sourceName: source.name, sourceType: source.type, startedAt });
   const limit = Number.isInteger(source.videosPerScan) ? Math.min(10000, Math.max(1, source.videosPerScan)) : LIMIT;
-  let inspected = 0, matched = 0, rejected = 0, ocrAttempted = 0, ocrWarned = false, ocrLimitLogged = false; const errors = [];
-  logger.info('source_scan_started', { sourceId: sourceKey, sourceName: source.name, sourceType: source.type, maxEntries: limit, scanDescription: source.scanDescription !== false, generateNfo: source.generateNfo === true, thumbnailOcrEnabled: source.thumbnailOcrEnabled === true, thumbnailOcrMaxPerScan: MAX_OCR_PER_SCAN });
+  let inspected = 0, matched = 0, rejected = 0, geminiAttempted = 0, geminiWarned = false; const errors = [];
+  logger.info('source_scan_started', { sourceId: sourceKey, sourceName: source.name, sourceType: source.type, maxEntries: limit, scanDescription: source.scanDescription !== false, generateNfo: source.generateNfo === true, thumbnailGeminiEnabled: source.thumbnailGeminiEnabled === true });
   try {
     const entries = await runYtDlp(source, limit);
     for (const entry of entries.slice(0, limit)) {
@@ -205,23 +177,18 @@ async function scanSource(source) {
       try {
         const description = source.generateNfo === true ? await descriptionFromNfo(source, entry, id) : (entry.description || '');
         let result = findMatches(source, entry, description);
-        if (!result.accepted && source.thumbnailOcrEnabled === true && (source.keywords || []).some(Boolean)) {
-          if (ocrAttempted < MAX_OCR_PER_SCAN) {
-            ocrAttempted++;
-            const thumbnail = entry.thumbnail || (Array.isArray(entry.thumbnails) && entry.thumbnails.at(-1)?.url);
-            try {
-              if (!thumbnail) throw new Error('No thumbnail URL in video metadata');
-              const thumbnailText = await thumbnailTextFromUrl(thumbnail);
-              result = findMatches(source, entry, description, thumbnailText);
-            } catch (err) {
-              if (!ocrWarned) {
-                logger.warn('thumbnail_ocr_unavailable_or_failed', { sourceId: sourceKey, sourceName: source.name, message: err.message, hint: 'Metadata matching will continue; install Tesseract OCR and English language data in the runtime.' });
-                ocrWarned = true;
-              }
+        if (source.thumbnailGeminiEnabled === true) {
+          geminiAttempted++;
+          const thumbnail = entry.thumbnail || (Array.isArray(entry.thumbnails) && entry.thumbnails.at(-1)?.url);
+          try {
+            if (!thumbnail) throw new Error('No thumbnail URL in video metadata');
+            const thumbnailText = await thumbnailTextFromUrl(thumbnail);
+            result = findMatches(source, entry, description, thumbnailText);
+          } catch (err) {
+            if (!geminiWarned) {
+              logger.warn('thumbnail_gemini_failed', { sourceId: sourceKey, sourceName: source.name, message: err.message, hint: 'Metadata matching will continue; verify GEMINI_API_KEY and Gemini API access.' });
+              geminiWarned = true;
             }
-          } else if (!ocrLimitLogged) {
-            logger.info('thumbnail_ocr_scan_limit_reached', { sourceId: sourceKey, sourceName: source.name, maxPerScan: MAX_OCR_PER_SCAN });
-            ocrLimitLogged = true;
           }
         }
         if (!result.accepted) {
@@ -240,7 +207,7 @@ async function scanSource(source) {
     const completedAt = new Date();
     await Source.updateOne({ _id: source._id }, { $set: { lastScannedAt: completedAt } });
     await ScanHistory.updateOne({ _id: history._id }, { $set: { completedAt, inspected, matched, rejected, errorCount: errors.length, errorDetails: errors, status: errors.length ? (inspected ? 'PARTIAL' : 'FAILED') : 'COMPLETED' } });
-    logger.info('source_scan_completed', { sourceId: sourceKey, sourceName: source.name, status: errors.length ? (inspected ? 'PARTIAL' : 'FAILED') : 'COMPLETED', inspected, matched, rejected, thumbnailOcrAttempted: ocrAttempted, errors: errors.length, durationMs: completedAt.getTime() - startedAt.getTime() });
+    logger.info('source_scan_completed', { sourceId: sourceKey, sourceName: source.name, status: errors.length ? (inspected ? 'PARTIAL' : 'FAILED') : 'COMPLETED', inspected, matched, rejected, thumbnailGeminiAttempted: geminiAttempted, errors: errors.length, durationMs: completedAt.getTime() - startedAt.getTime() });
     return { sourceId: sourceKey, inspected, matched, rejected, errors: errors.length };
   } catch (err) {
     errors.push(err.message);
@@ -259,6 +226,7 @@ async function scanAll() {
   if (activeAll) throw new Error('A full scan is already running');
   activeAll = true;
   try {
+    await migrateLegacyThumbnailSetting();
     const sources = await Source.find({ enabled: true }).sort({ createdAt: 1 }).lean();
     logger.info('full_scan_started', { enabledSources: sources.length, defaultMaxEntriesPerSource: LIMIT, perSourceLimitsEnabled: true });
     const results = [];
@@ -268,12 +236,17 @@ async function scanAll() {
   } finally { activeAll = false; }
 }
 async function scanOne(id) {
+  await migrateLegacyThumbnailSetting();
   const source = await Source.findById(id).lean();
   if (!source) { const err = new Error('Source not found'); err.status = 404; throw err; }
   if (!source.enabled) { const err = new Error('Source is disabled'); err.status = 409; throw err; }
   return scanSource(source);
 }
-module.exports = { scanAll, scanOne, runYtDlp, findMatches, LIMIT };
+async function migrateLegacyThumbnailSetting() {
+  await Source.collection.updateMany({ thumbnailOcrEnabled: true }, { $set: { thumbnailGeminiEnabled: true }, $unset: { thumbnailOcrEnabled: 1 } });
+  await Source.collection.updateMany({ thumbnailOcrEnabled: { $exists: true } }, { $unset: { thumbnailOcrEnabled: 1 } });
+}
+module.exports = { scanAll, scanOne, runYtDlp, findMatches, migrateLegacyThumbnailSetting, LIMIT };
 if (require.main === module) {
   require('dotenv').config();
   const { connectDB } = require('./db');
