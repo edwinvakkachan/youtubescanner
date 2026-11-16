@@ -1,6 +1,6 @@
 'use strict';
 const $ = s => document.querySelector(s);
-const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', timer: null, sorts: {} };
+const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', sourceSearch: '', timer: null, sorts: {} };
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
 async function api(url, options = {}) {
   const response = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options });
@@ -34,9 +34,9 @@ async function renderOverview() {
 }
 async function renderSources() {
   const sources = await api('/api/sources');
-  const tabs = `<div class="toolbar">${['channel', 'playlist', 'shorts'].map(t => `<button class="smallbtn ${state.sourceType === t ? 'active' : ''}" data-type="${t}">${t[0].toUpperCase() + t.slice(1)} (${sources.filter(s => s.type === t).length})</button>`).join('')}<button class="button primary" id="addSource">+ Add source</button></div>`;
+  const tabs = `<div class="toolbar"><label class="source-search">Search sources<input id="sourceSearch" type="search" placeholder="Channel or source name" value="${escapeHtml(state.sourceSearch)}"></label>${['channel', 'playlist', 'shorts'].map(t => `<button class="smallbtn ${state.sourceType === t ? 'active' : ''}" data-type="${t}">${t[0].toUpperCase() + t.slice(1)} (${sources.filter(s => s.type === t).length})</button>`).join('')}<button class="button primary" id="addSource">+ Add source</button></div>`;
   const shown = sources.filter(s => s.type === state.sourceType);
-  const cards = shown.length ? `<div class="source-grid">${shown.map(s => `<article class="source-card"><div class="source-title"><div><h3>${escapeHtml(s.name)}</h3><div class="source-url" title="${escapeHtml(s.url)}">${escapeHtml(s.url)}</div></div>${badge(s.enabled ? 'ENABLED' : 'DISABLED')}</div><div class="tagrow">${badge(s.priority)}<span class="tag">${escapeHtml(s.matchMode)} match</span><span class="tag">${s.videosPerScan || 50} videos/scan</span><span class="tag">Description ${s.scanDescription === false && !s.generateNfo ? 'off' : 'on'}</span>${s.generateNfo ? '<span class="tag">NFO enabled</span>' : ''}${s.thumbnailGeminiEnabled ? '<span class="tag">Gemini thumbnail analysis enabled</span>' : ''}${(s.keywords || []).map(k => `<span class="tag">${escapeHtml(k)}</span>`).join('')}${(s.excludeKeywords || []).map(k => `<span class="tag">− ${escapeHtml(k)}</span>`).join('')}</div><div class="cardfoot"><small>Last scan: ${s.lastScannedAt ? new Date(s.lastScannedAt).toLocaleString() : 'Never scanned'}</small><div class="actions"><button class="smallbtn" data-act="scan-source" data-id="${s._id}">Scan</button><button class="smallbtn" data-act="toggle-gemini" data-id="${s._id}">${s.thumbnailGeminiEnabled ? 'Disable Gemini' : 'Enable Gemini'}</button><button class="smallbtn" data-act="edit-source" data-id="${s._id}">Edit</button><button class="smallbtn" data-act="toggle-source" data-id="${s._id}">${s.enabled ? 'Disable' : 'Enable'}</button><button class="smallbtn" data-act="delete-source" data-id="${s._id}">Delete</button></div></div></article>`).join('')}</div>` : '<div class="empty"><strong>No sources configured</strong>Add a YouTube channel, playlist, or Shorts source to start discovering videos.</div>';
+  const cards = shown.length ? `<div class="source-grid">${shown.map(s => `<article class="source-card" data-source-name="${escapeHtml(s.name.toLocaleLowerCase())}"><div class="source-title"><div><h3>${escapeHtml(s.name)}</h3><div class="source-url" title="${escapeHtml(s.url)}">${escapeHtml(s.url)}</div></div>${badge(s.enabled ? 'ENABLED' : 'DISABLED')}</div><div class="tagrow">${badge(s.priority)}<span class="tag">${escapeHtml(s.matchMode)} match</span><span class="tag">${s.videosPerScan || 50} videos/scan</span><span class="tag">Description ${s.scanDescription === false && !s.generateNfo ? 'off' : 'on'}</span>${s.generateNfo ? '<span class="tag">NFO enabled</span>' : ''}${s.thumbnailGeminiEnabled ? '<span class="tag">Gemini thumbnail analysis enabled</span>' : ''}${(s.keywords || []).map(k => `<span class="tag">${escapeHtml(k)}</span>`).join('')}${(s.excludeKeywords || []).map(k => `<span class="tag">− ${escapeHtml(k)}</span>`).join('')}</div><div class="cardfoot"><small>Last scan: ${s.lastScannedAt ? new Date(s.lastScannedAt).toLocaleString() : 'Never scanned'}</small><div class="actions"><button class="smallbtn" data-act="scan-source" data-id="${s._id}">Scan</button><button class="smallbtn" data-act="toggle-gemini" data-id="${s._id}">${s.thumbnailGeminiEnabled ? 'Disable Gemini' : 'Enable Gemini'}</button><button class="smallbtn" data-act="edit-source" data-id="${s._id}">Edit</button><button class="smallbtn" data-act="toggle-source" data-id="${s._id}">${s.enabled ? 'Disable' : 'Enable'}</button><button class="smallbtn" data-act="delete-source" data-id="${s._id}">Delete</button></div></div></article>`).join('')}</div><div id="sourceSearchEmpty" class="empty" hidden><strong>No matching sources</strong>Try another source name.</div>` : '<div class="empty"><strong>No sources configured</strong>Add a YouTube channel, playlist, or Shorts source to start discovering videos.</div>';
   $('#content').innerHTML = `${shell('Manage sources', 'Configure YouTube sources and their discovery rules', tabs)}${cards}</div>`;
 }
 const views = {
@@ -116,6 +116,18 @@ $('#content').addEventListener('click', async e => {
     if (btn.dataset.act === 'scan-source') { btn.disabled = true; btn.textContent = 'Scanning…'; const r = await api(`/api/scan/${id}`, { method: 'POST' }); toast(`Scan complete: ${r.matched} matches, ${r.errors} errors`); }
     await render();
   } catch (err) { toast(err.message, true); }
+});
+$('#content').addEventListener('input', e => {
+  if (e.target.id !== 'sourceSearch') return;
+  state.sourceSearch = e.target.value;
+  const query = state.sourceSearch.trim().toLocaleLowerCase();
+  let visible = 0;
+  $('#content').querySelectorAll('.source-card').forEach(card => {
+    card.hidden = !card.dataset.sourceName.includes(query);
+    if (!card.hidden) visible++;
+  });
+  const empty = $('#sourceSearchEmpty');
+  if (empty) empty.hidden = visible > 0;
 });
 $('#content').addEventListener('change', e => { if (!e.target.matches('[data-sort]')) return; state.sorts[state.view] = e.target.value; state.page = 1; render().catch(err => toast(err.message, true)); });
 $('#content').addEventListener('change', async e => { if (e.target.id === 'keywordSource') { try { const sources = await api('/api/sources'); const source = sources.find(s => s._id === e.target.value); if (source) await fillKeywords(source); } catch (err) { toast(err.message, true); } } });
