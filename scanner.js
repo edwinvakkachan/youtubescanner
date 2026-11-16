@@ -93,7 +93,7 @@ async function thumbnailTextFromUrl(url, visualReference = null) {
     body: JSON.stringify(requestBody)
   });
   const payload = await result.json().catch(() => ({}));
-  if (!result.ok) throw new Error(payload.error?.message || `Gemini API returned HTTP ${result.status}`);
+  if (!result.ok) throw new Error(`${payload.error?.message || 'Gemini API request failed'} (HTTP ${result.status})`);
   const responseText = payload.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('\n').trim();
   if (responseText === undefined) throw new Error('Gemini returned no thumbnail analysis');
   if (!visualReference) return { text: responseText, visualMatch: false };
@@ -150,7 +150,12 @@ async function scanNewGeminiThumbnails(source, entries) {
     } catch (err) {
       error = { youtubeId: id, message: err.message };
       logger.gemini('ERROR', { model: 'gemini-3.1-flash-lite', sourceId: String(source._id), sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), message: err.message });
-      break;
+      // Don't let one unsupported/corrupt thumbnail block all later videos.
+      // Mark it scanned so periodic scans can progress without repeatedly
+      // spending a Gemini request on the same image. Visual mode fails closed
+      // in scanSource when this ID has no successful comparison result.
+      await Source.updateOne({ _id: source._id }, { $set: { geminiLastScannedVideoId: id } });
+      source.geminiLastScannedVideoId = id;
     }
   }
   return { results, skippedIds, attempted, error };
@@ -247,7 +252,7 @@ async function scanSource(source) {
     if (source.thumbnailGeminiEnabled === true || source.visualMatchEnabled === true) {
       geminiResults = await scanNewGeminiThumbnails(source, entries.slice(0, limit));
       geminiAttempted = geminiResults.attempted;
-      if (geminiResults.error) logger.warn('thumbnail_gemini_failed', { sourceId: sourceKey, sourceName: source.name, youtubeId: geminiResults.error.youtubeId, message: geminiResults.error.message, hint: 'The Gemini cursor remains before this video; verify GEMINI_API_KEY and Gemini API access.' });
+      if (geminiResults.error) logger.warn('thumbnail_gemini_failed', { sourceId: sourceKey, sourceName: source.name, youtubeId: geminiResults.error.youtubeId, message: geminiResults.error.message, hint: 'This thumbnail was skipped and the cursor advanced. Toggle Gemini off and on to reset the cursor and retry it; verify GEMINI_API_KEY and Gemini API access.' });
     }
     for (const entry of entries.slice(0, limit)) {
       const id = videoId(entry); if (!id) continue;
@@ -261,7 +266,7 @@ async function scanSource(source) {
         const result = geminiResult || (source.visualMatchEnabled ? { accepted: false, matches: [] } : findMatches(source, entry, description));
         if (!result.accepted) {
           rejected++;
-          logger.debug('video_rejected_by_keywords', { sourceId: sourceKey, youtubeId: id, descriptionChecked: source.scanDescription !== false, nfoUsed: source.generateNfo === true });
+          logger.debug(source.visualMatchEnabled && !geminiResult ? 'video_rejected_visual_comparison_unavailable' : 'video_rejected_by_keywords', { sourceId: sourceKey, youtubeId: id, descriptionChecked: source.scanDescription !== false, nfoUsed: source.generateNfo === true });
           continue;
         }
         if (!geminiResults.results.has(id)) await upsertVideo(source, entry, result.matches);
