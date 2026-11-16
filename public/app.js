@@ -107,11 +107,31 @@ function showSource(source = null) {
   form.elements.videosPerScan.value = source?.videosPerScan || 50;
   form.elements.generateNfo.checked = source?.generateNfo ?? false;
   form.elements.thumbnailGeminiEnabled.checked = source?.thumbnailGeminiEnabled ?? false;
+  form.elements.visualMatchEnabled.checked = source?.visualMatchEnabled ?? false;
+  form.elements.visualMatchAutoApprove.checked = source?.visualMatchAutoApprove ?? true;
+  form.dataset.hasVisualReference = String(Boolean(source?.visualReferenceMimeType));
+  $('#visualReferenceStatus').textContent = source?.visualReferenceMimeType ? `Saved reference image (${source.visualReferenceMimeType})` : 'No reference image uploaded';
+  $('#removeVisualReference').hidden = !source?.visualReferenceMimeType;
+  $('#visualAutoApproveField').hidden = !form.elements.visualMatchEnabled.checked;
   form.elements.scanDescription.checked = source?.scanDescription !== false || form.elements.generateNfo.checked;
   for (const key of ['name', 'url', 'type', 'priority', 'matchMode']) if (source && source[key] !== undefined) form.elements[key].value = source[key];
   $('#autoApproveField').hidden = form.elements.type.value !== 'channel';
   form.elements.keywords.value = (source?.keywords || []).join(', '); form.elements.excludeKeywords.value = (source?.excludeKeywords || []).join(', '); $('#sourceDialog').showModal();
 }
+$('#sourceForm').elements.visualMatchEnabled.addEventListener('change', e => { $('#visualAutoApproveField').hidden = !e.target.checked; });
+$('#sourceForm').elements.visualReferenceFile.addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (file) { $('#visualReferenceStatus').textContent = `Selected: ${file.name}`; e.currentTarget.form.elements.visualMatchEnabled.checked = true; $('#visualAutoApproveField').hidden = false; }
+});
+$('#removeVisualReference').addEventListener('click', async () => {
+  const form = $('#sourceForm'); const id = form.elements.id.value;
+  try {
+    if (id && form.dataset.hasVisualReference === 'true') await api(`/api/sources/${id}/visual-reference`, { method: 'DELETE' });
+    form.dataset.hasVisualReference = 'false'; form.elements.visualReferenceFile.value = ''; form.elements.visualMatchEnabled.checked = false;
+    $('#visualReferenceStatus').textContent = 'No reference image uploaded'; $('#removeVisualReference').hidden = true; $('#visualAutoApproveField').hidden = true;
+    toast('Reference image removed');
+  } catch (err) { toast(err.message, true); }
+});
 $('#sourceForm').elements.type.addEventListener('change', e => { $('#autoApproveField').hidden = e.target.value !== 'channel'; });
 function splitWords(s) { return s.split(',').map(x => x.trim()).filter(Boolean); }
 async function fillKeywords(source) {
@@ -157,7 +177,35 @@ $('#content').addEventListener('input', e => {
 $('#content').addEventListener('change', e => { if (!e.target.matches('[data-sort]')) return; state.sorts[state.view] = e.target.value; state.page = 1; render().catch(err => toast(err.message, true)); });
 $('#content').addEventListener('change', e => { if (e.target.id !== 'approvalChannelFilter') return; state.approvalChannelId = e.target.value; state.page = 1; render().catch(err => toast(err.message, true)); });
 $('#content').addEventListener('change', async e => { if (e.target.id === 'keywordSource') { try { const sources = await api('/api/sources'); const source = sources.find(s => s._id === e.target.value); if (source) await fillKeywords(source); } catch (err) { toast(err.message, true); } } });
-$('#sourceForm').addEventListener('submit', async e => { e.preventDefault(); const f = e.currentTarget; const body = { name: f.elements.name.value.trim(), url: f.elements.url.value.trim(), type: f.elements.type.value, priority: f.elements.priority.value, matchMode: f.elements.matchMode.value, enabled: f.elements.enabled.checked, videosPerScan: Number(f.elements.videosPerScan.value), scanDescription: f.elements.scanDescription.checked || f.elements.generateNfo.checked, generateNfo: f.elements.generateNfo.checked, thumbnailGeminiEnabled: f.elements.thumbnailGeminiEnabled.checked, autoApproveVideos: f.elements.type.value === 'channel' && f.elements.autoApproveVideos.checked, keywords: splitWords(f.elements.keywords.value), excludeKeywords: splitWords(f.elements.excludeKeywords.value) }; try { const id = f.elements.id.value; await api(id ? `/api/sources/${id}` : '/api/sources', { method: id ? 'PUT' : 'POST', body: JSON.stringify(body) }); $('#sourceDialog').close(); toast(id ? 'Source updated' : 'Source added'); await render(); } catch (err) { toast(err.message, true); } });
+$('#sourceForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const f = e.currentTarget;
+  const id = f.elements.id.value;
+  const image = f.elements.visualReferenceFile.files[0];
+  const wantsVisualMatch = f.elements.visualMatchEnabled.checked;
+  if (wantsVisualMatch && !image && f.dataset.hasVisualReference !== 'true') return toast('Choose a reference image before enabling visual matching', true);
+  const body = {
+    name: f.elements.name.value.trim(), url: f.elements.url.value.trim(), type: f.elements.type.value,
+    priority: f.elements.priority.value, matchMode: f.elements.matchMode.value, enabled: f.elements.enabled.checked,
+    videosPerScan: Number(f.elements.videosPerScan.value), scanDescription: f.elements.scanDescription.checked || f.elements.generateNfo.checked,
+    generateNfo: f.elements.generateNfo.checked, thumbnailGeminiEnabled: f.elements.thumbnailGeminiEnabled.checked,
+    visualMatchEnabled: wantsVisualMatch && !image, visualMatchAutoApprove: f.elements.visualMatchAutoApprove.checked,
+    autoApproveVideos: f.elements.type.value === 'channel' && f.elements.autoApproveVideos.checked,
+    keywords: splitWords(f.elements.keywords.value), excludeKeywords: splitWords(f.elements.excludeKeywords.value)
+  };
+  try {
+    const saved = await api(id ? `/api/sources/${id}` : '/api/sources', { method: id ? 'PUT' : 'POST', body: JSON.stringify(body) });
+    const sourceId = id || saved._id;
+    if (image) {
+      const response = await fetch(`/api/sources/${sourceId}/visual-reference`, { method: 'PUT', headers: { 'Content-Type': image.type }, body: image });
+      let result; try { result = await response.json(); } catch { result = {}; }
+      if (!response.ok) throw new Error(result.error || `Image upload failed (${response.status})`);
+      f.dataset.hasVisualReference = 'true';
+      if (wantsVisualMatch) await api(`/api/sources/${sourceId}`, { method: 'PUT', body: JSON.stringify({ visualMatchEnabled: true }) });
+    }
+    $('#sourceDialog').close(); toast(id ? 'Source updated' : 'Source added'); await render();
+  } catch (err) { toast(err.message, true); }
+});
 $('#content').addEventListener('submit', async e => {
   if (e.target.id !== 'scanSettingsForm') return;
   e.preventDefault();

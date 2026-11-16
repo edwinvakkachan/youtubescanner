@@ -58,13 +58,13 @@ function findMatches(source, entry, description = entry.description || '', thumb
   const includedDescription = source.scanDescription === false && source.generateNfo !== true ? '' : description;
   const text = `${entry.title || ''}\n${includedDescription}\n${thumbnailText}`.toLocaleLowerCase();
   const excludes = source.excludeKeywords || [];
-  if (excludes.some(k => k && text.includes(k.toLocaleLowerCase()))) return { accepted: false, matches: [] };
+  if (excludes.some(k => k && text.includes(k.toLocaleLowerCase()))) return { accepted: false, matches: [], excluded: true };
   const includes = (source.keywords || []).filter(Boolean);
-  if (!includes.length) return { accepted: true, matches: [] };
+  if (!includes.length) return { accepted: true, matches: [], excluded: false };
   const matches = includes.filter(k => text.includes(k.toLocaleLowerCase()));
-  return { accepted: source.matchMode === 'ALL' ? matches.length === includes.length : matches.length > 0, matches };
+  return { accepted: source.matchMode === 'ALL' ? matches.length === includes.length : matches.length > 0, matches, excluded: false };
 }
-async function thumbnailTextFromUrl(url) {
+async function thumbnailTextFromUrl(url, visualReference = null) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not configured');
   const parsed = new URL(url);
@@ -76,23 +76,43 @@ async function thumbnailTextFromUrl(url) {
   const mimeType = (response.headers.get('content-type') || '').split(';')[0].toLowerCase();
   if (!['image/jpeg', 'image/png', 'image/webp'].includes(mimeType)) throw new Error(`Unsupported thumbnail format: ${mimeType || 'unknown'}`);
   const image = Buffer.from(await response.arrayBuffer());
+  const parts = [{ text: visualReference
+    ? 'Compare the reference image with the YouTube thumbnail. Ignore all people and faces completely; do not compare or identify anyone. Decide whether the same non-person object or a distinctive scene shown in the reference is visibly present in the thumbnail. Also transcribe visible thumbnail text. Return JSON with boolean visual_match and string thumbnail_text. Set visual_match true only for a clear match of the same object or distinctive scene, not merely a similar category.'
+    : 'Read and transcribe every word visible in this YouTube thumbnail. Preserve the original scripts and wording. Return only the visible text, without explanation.' }];
+  if (visualReference) parts.push({ inline_data: { mime_type: visualReference.mimeType, data: visualReference.image.toString('base64') } });
+  parts.push({ inline_data: { mime_type: mimeType, data: image.toString('base64') } });
+  const requestBody = { contents: [{ parts }] };
+  if (visualReference) requestBody.generationConfig = {
+    responseMimeType: 'application/json',
+    responseSchema: { type: 'OBJECT', properties: { visual_match: { type: 'BOOLEAN' }, thumbnail_text: { type: 'STRING' } }, required: ['visual_match', 'thumbnail_text'] }
+  };
   const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent';
   const result = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-    body: JSON.stringify({ contents: [{ parts: [
-      { text: 'Read and transcribe every word visible in this YouTube thumbnail. Preserve the original scripts and wording. Return only the visible text, without explanation.' },
-      { inline_data: { mime_type: mimeType, data: image.toString('base64') } }
-    ] }] })
+    body: JSON.stringify(requestBody)
   });
   const payload = await result.json().catch(() => ({}));
   if (!result.ok) throw new Error(payload.error?.message || `Gemini API returned HTTP ${result.status}`);
-  const text = payload.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('\n').trim();
-  if (text === undefined) throw new Error('Gemini returned no thumbnail text');
-  return text;
+  const responseText = payload.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('\n').trim();
+  if (responseText === undefined) throw new Error('Gemini returned no thumbnail analysis');
+  if (!visualReference) return { text: responseText, visualMatch: false };
+  const analysis = JSON.parse(responseText);
+  if (typeof analysis.visual_match !== 'boolean' || typeof analysis.thumbnail_text !== 'string') throw new Error('Gemini returned an invalid visual match result');
+  return { text: analysis.thumbnail_text, visualMatch: analysis.visual_match };
 }
 async function scanNewGeminiThumbnails(source, entries) {
   const results = new Map();
+  let visualReference = null;
+  if (source.visualMatchEnabled) {
+    try {
+      const storedSource = await Source.findById(source._id).select('+visualReferenceImage visualReferenceMimeType').lean();
+      if (!storedSource?.visualReferenceImage || !storedSource.visualReferenceMimeType) throw new Error('Visual matching is enabled but its reference image is missing');
+      visualReference = { image: Buffer.from(storedSource.visualReferenceImage), mimeType: storedSource.visualReferenceMimeType };
+    } catch (err) {
+      return { results, skippedIds: new Set(), attempted: 0, error: { youtubeId: null, message: err.message } };
+    }
+  }
   const cursor = source.geminiLastScannedVideoId || '';
   const cursorIndex = cursor ? entries.findIndex(entry => videoId(entry) === cursor) : -1;
   let candidates; let skippedEntries = [];
@@ -113,13 +133,20 @@ async function scanNewGeminiThumbnails(source, entries) {
       if (!thumbnail) throw new Error('No thumbnail URL in video metadata');
       attempted++;
       logger.gemini('REQUEST', { model: 'gemini-3.1-flash-lite', sourceId: String(source._id), sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180) });
-      const text = await thumbnailTextFromUrl(thumbnail);
-      const match = findMatches(source, entry, entry.description || '', text);
+      const analysis = await thumbnailTextFromUrl(thumbnail, visualReference);
+      const keywordMatch = findMatches(source, entry, entry.description || '', analysis.text);
+      const hasIncludes = (source.keywords || []).some(Boolean);
+      const accepted = keywordMatch.excluded ? false : source.visualMatchEnabled
+        ? analysis.visualMatch || (hasIncludes && keywordMatch.accepted)
+        : keywordMatch.accepted;
+      const matches = [...keywordMatch.matches];
+      if (analysis.visualMatch) matches.push('visual-reference-match');
+      const match = { accepted, matches, excluded: keywordMatch.excluded };
       if (match.accepted) await upsertVideo(source, entry, match.matches);
       await Source.updateOne({ _id: source._id }, { $set: { geminiLastScannedVideoId: id } });
       source.geminiLastScannedVideoId = id;
-      results.set(id, { accepted: match.accepted, matches: match.matches, text });
-      logger.gemini(match.accepted ? 'ACCEPTED' : 'REJECTED', { model: 'gemini-3.1-flash-lite', sourceId: String(source._id), sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), extractedText: text, matchedKeywords: match.matches, matchMode: source.matchMode || 'ANY' });
+      results.set(id, { accepted: match.accepted, matches: match.matches, text: analysis.text });
+      logger.gemini(match.accepted ? 'ACCEPTED' : 'REJECTED', { model: 'gemini-3.1-flash-lite', sourceId: String(source._id), sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), extractedText: analysis.text, visualMatch: analysis.visualMatch, matchedKeywords: match.matches, matchMode: source.matchMode || 'ANY' });
     } catch (err) {
       error = { youtubeId: id, message: err.message };
       logger.gemini('ERROR', { model: 'gemini-3.1-flash-lite', sourceId: String(source._id), sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), message: err.message });
@@ -163,7 +190,9 @@ async function upsertVideo(source, entry, matches) {
   const priority = source.priority || 'NORMAL';
   // Stable contribution allows $addToSet to deduplicate this source on rediscovery.
   const contribution = { sourceId: source._id, name: source.name, type: source.type, priority, matchedKeywords: matches };
-  const approval = source.autoApproveVideos || String(process.env.REQUIRE_MANUAL_APPROVAL || 'true').toLowerCase() !== 'true' ? 'APPROVED' : 'PENDING';
+  const visualAutoApprove = source.visualMatchEnabled && source.visualMatchAutoApprove && matches.includes('visual-reference-match');
+  const autoApprove = source.autoApproveVideos || visualAutoApprove;
+  const approval = autoApprove || String(process.env.REQUIRE_MANUAL_APPROVAL || 'true').toLowerCase() !== 'true' ? 'APPROVED' : 'PENDING';
   const url = videoUrl(entry, id);
   try {
     await QueuedVideo.updateOne({ youtubeId: id }, {
@@ -179,7 +208,7 @@ async function upsertVideo(source, entry, matches) {
     }, { upsert: true });
     // Keep display priority aligned with the highest-priority source, without changing importer/approval state.
     await QueuedVideo.updateOne({ youtubeId: id, priorityRank: PRIORITY_RANK[priority] || 2 }, { $set: { priority } });
-    if (source.autoApproveVideos) await QueuedVideo.updateOne({ youtubeId: id, approvalStatus: 'PENDING', status: { $in: ['AWAITING_APPROVAL', 'PENDING'] } }, { $set: { approvalStatus: 'APPROVED', status: 'PENDING' } });
+    if (autoApprove) await QueuedVideo.updateOne({ youtubeId: id, approvalStatus: 'PENDING', status: { $in: ['AWAITING_APPROVAL', 'PENDING'] } }, { $set: { approvalStatus: 'APPROVED', status: 'PENDING' } });
   } catch (err) {
     if (err.code !== 11000) throw err;
     // Another scan inserted this ID between our lookup/upsert attempt. Add our
@@ -189,7 +218,7 @@ async function upsertVideo(source, entry, matches) {
       $min: { priorityRank: PRIORITY_RANK[priority] || 2 }
     });
     await QueuedVideo.updateOne({ youtubeId: id, priorityRank: PRIORITY_RANK[priority] || 2 }, { $set: { priority } });
-    if (source.autoApproveVideos) await QueuedVideo.updateOne({ youtubeId: id, approvalStatus: 'PENDING', status: { $in: ['AWAITING_APPROVAL', 'PENDING'] } }, { $set: { approvalStatus: 'APPROVED', status: 'PENDING' } });
+    if (autoApprove) await QueuedVideo.updateOne({ youtubeId: id, approvalStatus: 'PENDING', status: { $in: ['AWAITING_APPROVAL', 'PENDING'] } }, { $set: { approvalStatus: 'APPROVED', status: 'PENDING' } });
   }
 }
 async function scanSource(source) {
@@ -211,11 +240,11 @@ async function scanSource(source) {
     Source.updateOne({ _id: source._id, scanLockToken: lockToken }, { $set: { scanLockUntil: new Date(Date.now() + 6 * 60 * 1000) } })
       .catch(err => logger.warn('source_scan_lock_heartbeat_failed', { sourceId: sourceKey, sourceName: source.name, message: err.message }));
   }, 60_000);
-  logger.info('source_scan_started', { sourceId: sourceKey, sourceName: source.name, sourceType: source.type, maxEntries: limit, scanDescription: source.scanDescription !== false, generateNfo: source.generateNfo === true, thumbnailGeminiEnabled: source.thumbnailGeminiEnabled === true });
+  logger.info('source_scan_started', { sourceId: sourceKey, sourceName: source.name, sourceType: source.type, maxEntries: limit, scanDescription: source.scanDescription !== false, generateNfo: source.generateNfo === true, thumbnailGeminiEnabled: source.thumbnailGeminiEnabled === true, visualMatchEnabled: source.visualMatchEnabled === true });
   try {
     const entries = await runYtDlp(source, limit);
     let geminiResults = { results: new Map(), skippedIds: new Set(), attempted: 0, error: null };
-    if (source.thumbnailGeminiEnabled === true) {
+    if (source.thumbnailGeminiEnabled === true || source.visualMatchEnabled === true) {
       geminiResults = await scanNewGeminiThumbnails(source, entries.slice(0, limit));
       geminiAttempted = geminiResults.attempted;
       if (geminiResults.error) logger.warn('thumbnail_gemini_failed', { sourceId: sourceKey, sourceName: source.name, youtubeId: geminiResults.error.youtubeId, message: geminiResults.error.message, hint: 'The Gemini cursor remains before this video; verify GEMINI_API_KEY and Gemini API access.' });
@@ -225,8 +254,11 @@ async function scanSource(source) {
       inspected++;
       if (geminiResults.skippedIds.has(id)) continue;
       try {
-        const description = source.generateNfo === true ? await descriptionFromNfo(source, entry, id) : (entry.description || '');
-        const result = geminiResults.results.get(id) || findMatches(source, entry, description);
+        const geminiResult = geminiResults.results.get(id);
+        // Visual matching must fail closed: a Gemini error or an unprocessed
+        // entry cannot be accepted based only on title/description keywords.
+        const description = source.generateNfo === true && !source.visualMatchEnabled ? await descriptionFromNfo(source, entry, id) : (entry.description || '');
+        const result = geminiResult || (source.visualMatchEnabled ? { accepted: false, matches: [] } : findMatches(source, entry, description));
         if (!result.accepted) {
           rejected++;
           logger.debug('video_rejected_by_keywords', { sourceId: sourceKey, youtubeId: id, descriptionChecked: source.scanDescription !== false, nfoUsed: source.generateNfo === true });

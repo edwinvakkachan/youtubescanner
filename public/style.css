@@ -43,3 +43,4 @@ dialog::backdrop{background:#0009}
 @media(max-width:740px){.header-actions{flex-wrap:wrap;justify-content:flex-end}}
 .source-filter{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:11px;font-weight:600}.source-filter select{max-width:220px;border:1px solid var(--line);border-radius:7px;padding:9px 11px;background:var(--white);color:var(--ink);font-size:11px}@media(max-width:740px){.source-filter{width:100%}.source-filter select{flex:1;max-width:none}}
 .source-link{border:0;background:transparent;color:var(--teal);padding:2px 0;font:inherit;font-size:11px;font-weight:700;text-align:left;text-decoration:underline;text-underline-offset:2px;cursor:pointer}.source-link:hover{color:var(--ink)}
+.visual-reference-status,.visual-match-help{grid-column:1/-1}
