@@ -7,6 +7,7 @@ const { Source, QueuedVideo, ScanHistory, ScannerSettings } = require('./models'
 const scanner = require('./scanner');
 const scheduler = require('./scheduler');
 const logger = require('./logger');
+const imagekit = require('./imagekit');
 const app = express();
 app.use((req, res, next) => {
   const started = Date.now();
@@ -69,25 +70,65 @@ app.get('/api/health', (_req, res) => res.json({ ok: true, database: mongoose.co
 app.get('/api/sources', async (_req, res, next) => { try { res.json(await Source.find().sort({ type: 1, name: 1 }).lean()); } catch (e) { next(e); } });
 app.post('/api/sources', async (req, res, next) => { try { res.status(201).json(await Source.create(sourceInput(req.body))); } catch (e) { next(e); } });
 app.put('/api/sources/:id/visual-reference', express.raw({ type: ['image/jpeg', 'image/png', 'image/webp'], limit: '8mb' }), async (req, res, next) => {
+  let uploaded;
+  let persisted = false;
   try {
     objectId(req.params.id);
     if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(415).json({ error: 'Upload a JPEG, PNG, or WebP reference image' });
     const mimeType = String(req.headers['content-type'] || '').split(';')[0].toLowerCase();
-    const expectedBytes = req.body.length;
-    const source = await Source.findByIdAndUpdate(req.params.id, { $set: { visualReferenceImage: req.body, visualReferenceMimeType: mimeType, geminiLastScannedVideoId: '' } }, { new: true }).select('+visualReferenceImage visualReferenceMimeType visualMatchEnabled');
-    if (!source) return res.status(404).json({ error: 'Source not found' });
-    const savedBytes = source.visualReferenceImage?.length || 0;
-    if (savedBytes !== expectedBytes) {
-      logger.error('visual_reference_image_save_failed', { sourceId: req.params.id, sourceName: source.name, mimeType, expectedBytes, savedBytes });
-      return res.status(500).json({ error: 'The reference image was not saved completely. Please upload it again.' });
+    const current = await Source.findById(req.params.id).select('+visualReferenceFileId');
+    if (!current) return res.status(404).json({ error: 'Source not found' });
+    uploaded = await imagekit.uploadReferenceImage({ image: req.body, mimeType, sourceId: req.params.id });
+    const source = await Source.findByIdAndUpdate(req.params.id, {
+      $set: { visualReferenceFileId: uploaded.fileId, visualReferenceUrl: uploaded.url, visualReferenceMimeType: mimeType, geminiLastScannedVideoId: '' },
+      $unset: { visualReferenceImage: 1 }
+    }, { new: true }).select('visualReferenceMimeType visualMatchEnabled +visualReferenceFileId +visualReferenceUrl');
+    if (!source) throw Object.assign(new Error('Source was removed before its reference image could be saved'), { status: 404 });
+    persisted = true;
+    if (source.visualReferenceFileId !== uploaded.fileId || source.visualReferenceUrl !== uploaded.url) throw new Error('ImageKit returned an image but its reference was not saved to MongoDB');
+    logger.info('visual_reference_image_saved', { sourceId: req.params.id, sourceName: source.name, provider: 'imagekit', fileId: uploaded.fileId, mimeType, bytes: req.body.length });
+    if (current.visualReferenceFileId && current.visualReferenceFileId !== uploaded.fileId) {
+      try { await imagekit.deleteFile(current.visualReferenceFileId); }
+      catch (err) { logger.warn('visual_reference_image_old_file_delete_failed', { sourceId: req.params.id, sourceName: source.name, fileId: current.visualReferenceFileId, message: err.message }); }
     }
-    logger.info('visual_reference_image_saved', { sourceId: req.params.id, sourceName: source.name, mimeType, bytes: savedBytes });
-    res.json({ visualReferenceMimeType: source.visualReferenceMimeType, visualMatchEnabled: source.visualMatchEnabled, bytes: savedBytes });
+    res.json({ visualReferenceMimeType: source.visualReferenceMimeType, visualMatchEnabled: source.visualMatchEnabled, provider: 'imagekit' });
+  } catch (e) {
+    if (uploaded?.fileId && !persisted) await imagekit.deleteFile(uploaded.fileId).catch(err => logger.warn('visual_reference_image_upload_cleanup_failed', { sourceId: req.params.id, fileId: uploaded.fileId, message: err.message }));
+    if (uploaded) logger.error('visual_reference_image_save_failed', { sourceId: req.params.id, provider: 'imagekit', message: e.message });
+    next(e);
+  }
+});
+app.delete('/api/sources/:id/visual-reference', async (req, res, next) => {
+  try {
+    objectId(req.params.id);
+    const current = await Source.findById(req.params.id).select('+visualReferenceFileId');
+    if (!current) return res.status(404).json({ error: 'Source not found' });
+    const source = await Source.findByIdAndUpdate(req.params.id, {
+      $set: { visualReferenceMimeType: '', visualMatchEnabled: false, geminiLastScannedVideoId: '' },
+      $unset: { visualReferenceImage: 1, visualReferenceFileId: 1, visualReferenceUrl: 1 }
+    }, { new: true }).select('visualReferenceMimeType visualMatchEnabled');
+    if (current.visualReferenceFileId) {
+      try { await imagekit.deleteFile(current.visualReferenceFileId); }
+      catch (err) { logger.warn('visual_reference_image_delete_failed', { sourceId: req.params.id, sourceName: current.name, provider: 'imagekit', fileId: current.visualReferenceFileId, message: err.message }); }
+    }
+    logger.info('visual_reference_image_removed', { sourceId: req.params.id, sourceName: current.name, provider: current.visualReferenceFileId ? 'imagekit' : 'legacy_or_empty' });
+    res.json({ visualReferenceMimeType: '', visualMatchEnabled: false });
   } catch (e) { next(e); }
 });
-app.delete('/api/sources/:id/visual-reference', async (req, res, next) => { try { objectId(req.params.id); const source = await Source.findByIdAndUpdate(req.params.id, { $set: { visualReferenceMimeType: '', visualMatchEnabled: false, geminiLastScannedVideoId: '' }, $unset: { visualReferenceImage: 1 } }, { new: true }).select('visualReferenceMimeType visualMatchEnabled'); if (!source) return res.status(404).json({ error: 'Source not found' }); res.json({ visualReferenceMimeType: '', visualMatchEnabled: false }); } catch (e) { next(e); } });
 app.put('/api/sources/:id', async (req, res, next) => { try { objectId(req.params.id); const updates = sourceInput(req.body, true); const current = await Source.findById(req.params.id).select('type visualReferenceMimeType visualMatchEnabled'); if (!current) return res.status(404).json({ error: 'Source not found' }); if ((updates.type || current.type) !== 'channel' && updates.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 }); if (updates.visualMatchEnabled === true && !current.visualReferenceMimeType) throw Object.assign(new Error('Upload a reference image before enabling visual matching'), { status: 400 }); if (updates.visualMatchEnabled === true && !current.visualMatchEnabled) updates.geminiLastScannedVideoId = ''; const source = await Source.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true, runValidators: true }); res.json(source); } catch (e) { next(e); } });
-app.delete('/api/sources/:id', async (req, res, next) => { try { objectId(req.params.id); const source = await Source.findByIdAndDelete(req.params.id); if (!source) return res.status(404).json({ error: 'Source not found' }); res.json({ deleted: true }); } catch (e) { next(e); } });
+app.delete('/api/sources/:id', async (req, res, next) => {
+  try {
+    objectId(req.params.id);
+    const current = await Source.findById(req.params.id).select('+visualReferenceFileId');
+    if (!current) return res.status(404).json({ error: 'Source not found' });
+    await Source.deleteOne({ _id: req.params.id });
+    if (current.visualReferenceFileId) {
+      try { await imagekit.deleteFile(current.visualReferenceFileId); }
+      catch (err) { logger.warn('visual_reference_image_delete_failed', { sourceId: req.params.id, sourceName: current.name, provider: 'imagekit', fileId: current.visualReferenceFileId, message: err.message }); }
+    }
+    res.json({ deleted: true });
+  } catch (e) { next(e); }
+});
 app.get('/api/queue', async (req, res, next) => { try {
   const page = Math.max(1, Math.min(1000000, Number.parseInt(req.query.page || '1', 10) || 1));
   const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit || '50', 10) || 50));

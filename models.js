@@ -14,7 +14,9 @@ const sourceSchema = new Schema({
   visualMatchEnabled: { type: Boolean, default: false },
   visualMatchAutoApprove: { type: Boolean, default: true },
   visualReferenceMimeType: { type: String, default: '' },
-  visualReferenceImage: { type: Buffer, select: false },
+  visualReferenceFileId: { type: String, default: '', select: false },
+  visualReferenceUrl: { type: String, default: '', select: false },
+  visualReferenceImage: { type: Buffer, select: false }, // Legacy field, removed after ImageKit migration.
   generateNfo: { type: Boolean, default: false },
   keywords: { type: [String], default: [] },
   excludeKeywords: { type: [String], default: [] },

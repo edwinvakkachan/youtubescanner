@@ -8,6 +8,7 @@ const { randomUUID } = require('node:crypto');
 const { connectDB } = require('./db');
 const { Source, QueuedVideo, ScanHistory } = require('./models');
 const logger = require('./logger');
+const imagekit = require('./imagekit');
 
 const LIMIT = Math.min(10000, Math.max(1, Number.parseInt(process.env.VIDEOS_PER_SOURCE || '50', 10) || 50));
 const MAX_RETRIES = Math.max(1, Number.parseInt(process.env.MAX_RETRIES || '3', 10) || 3);
@@ -106,15 +107,28 @@ async function scanNewGeminiThumbnails(source, entries) {
   let visualReference = null;
   if (source.visualMatchEnabled) {
     try {
-      const storedSource = await Source.findById(source._id).select('+visualReferenceImage visualReferenceMimeType');
-      const storedImageBytes = storedSource?.visualReferenceImage?.length || 0;
-      if (!storedImageBytes || !storedSource.visualReferenceMimeType) {
-        logger.error('visual_reference_image_missing', { sourceId: String(source._id), sourceName: source.name, mimeType: storedSource?.visualReferenceMimeType || null, bytes: storedImageBytes, hint: 'Visual matching is enabled but MongoDB has no saved reference image. Re-upload the reference image in source settings.' });
-        throw new Error('Visual matching is enabled but its saved reference image is missing');
+      const storedSource = await Source.findById(source._id).select('+visualReferenceImage +visualReferenceFileId +visualReferenceUrl visualReferenceMimeType');
+      let fileId = storedSource?.visualReferenceFileId || '';
+      let imageUrl = storedSource?.visualReferenceUrl || '';
+      if ((!fileId || !imageUrl) && storedSource?.visualReferenceImage?.length && storedSource.visualReferenceMimeType) {
+        const legacyImage = Buffer.from(storedSource.visualReferenceImage);
+        const uploaded = await imagekit.uploadReferenceImage({ image: legacyImage, mimeType: storedSource.visualReferenceMimeType, sourceId: source._id });
+        await Source.updateOne({ _id: source._id }, {
+          $set: { visualReferenceFileId: uploaded.fileId, visualReferenceUrl: uploaded.url },
+          $unset: { visualReferenceImage: 1 }
+        });
+        fileId = uploaded.fileId;
+        imageUrl = uploaded.url;
+        logger.info('visual_reference_image_migrated_to_imagekit', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', fileId, mimeType: storedSource.visualReferenceMimeType, bytes: legacyImage.length });
       }
-      visualReference = { image: Buffer.from(storedSource.visualReferenceImage), mimeType: storedSource.visualReferenceMimeType };
-      logger.info('visual_reference_image_loaded', { sourceId: String(source._id), sourceName: source.name, mimeType: visualReference.mimeType, bytes: visualReference.image.length });
+      if (!fileId || !imageUrl || !storedSource?.visualReferenceMimeType) {
+        logger.error('visual_reference_image_missing', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', fileId: fileId || null, urlPresent: Boolean(imageUrl), mimeType: storedSource?.visualReferenceMimeType || null, hint: 'Visual matching is enabled but no saved ImageKit reference is available. Re-upload the reference image in source settings.' });
+        throw new Error('Visual matching is enabled but its saved ImageKit reference image is missing');
+      }
+      visualReference = await imagekit.downloadReferenceImage(imageUrl);
+      logger.info('visual_reference_image_loaded', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', fileId, mimeType: visualReference.mimeType, bytes: visualReference.image.length });
     } catch (err) {
+      if (!err.message.includes('saved ImageKit reference image is missing')) logger.error('visual_reference_image_load_failed', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', message: err.message });
       return { results, skippedIds: new Set(), attempted: 0, error: { youtubeId: null, message: err.message } };
     }
   }

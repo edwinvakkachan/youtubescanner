@@ -10,6 +10,7 @@ services:
       YT_DLP_PATH: /opt/yt-dlp/bin/yt-dlp
       LOG_LEVEL: ${LOG_LEVEL:-debug}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      IMAGEKIT_PRIVATE_KEY: ${IMAGEKIT_PRIVATE_KEY:-}
       NFO_DIRECTORY: /nfo
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
