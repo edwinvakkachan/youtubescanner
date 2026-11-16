@@ -78,6 +78,10 @@ app.get('/api/queue', async (req, res, next) => { try {
     const allowed = key === 'status' ? ['AWAITING_APPROVAL', 'PENDING', 'PROCESSING', 'SENT', 'PROCESSED', 'FAILED'] : key === 'approvalStatus' ? ['PENDING', 'APPROVED', 'REJECTED'] : priorities;
     if (!allowed.includes(req.query[key])) return res.status(400).json({ error: `Invalid ${key}` }); filter[key] = req.query[key];
   }
+  if (req.query.sourceId) {
+    objectId(String(req.query.sourceId));
+    filter['discoveredSources.sourceId'] = new mongoose.Types.ObjectId(String(req.query.sourceId));
+  }
   // Treat a PENDING queue request as an importer request: never expose pending
   // or rejected approvals unless the caller explicitly asks for an approval state.
   if (filter.status === 'PENDING' && !filter.approvalStatus) filter.approvalStatus = 'APPROVED';

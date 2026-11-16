@@ -1,6 +1,6 @@
 'use strict';
 const $ = s => document.querySelector(s);
-const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', sourceSearch: '', timer: null, sorts: {} };
+const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', sourceSearch: '', approvalChannelId: '', timer: null, sorts: {} };
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
 function applyTheme(theme, persist = true) {
   const selected = theme === 'light' ? 'light' : 'dark';
@@ -57,14 +57,17 @@ const views = {
 };
 async function renderQueue(view) {
   const [title, subtitle, filters] = views[view];
+  const channels = view === 'approval' ? (await api('/api/sources')).filter(source => source.type === 'channel') : [];
   const defaultSort = view === 'queue' ? 'priorityRank:asc' : 'discoveredAt:desc';
   const selectedSort = state.sorts[view] || defaultSort;
   const [sort, order] = selectedSort.split(':');
   const qs = new URLSearchParams({ page: String(state.page), limit: String(state.limit), sort, order, ...filters });
+  if (view === 'approval' && state.approvalChannelId) qs.set('sourceId', state.approvalChannelId);
   const data = await api(`/api/queue?${qs}`);
   const action = view === 'failed' ? 'failed' : (view === 'approval' ? 'approval' : 'none');
   const bulk = view === 'approval' ? '<button class="button" id="bulkApprove">Approve all on this page</button>' : '';
-  $('#content').innerHTML = `${shell(title, subtitle, `${sortControl(queueSorts, defaultSort)}${bulk}`)}${videoRows(data.items, action)}${paging(data)}</div>`;
+  const channelFilter = view === 'approval' ? `<label class="source-filter">Channel <select id="approvalChannelFilter"><option value="">All channels</option>${channels.map(source => `<option value="${source._id}" ${source._id === state.approvalChannelId ? 'selected' : ''}>${escapeHtml(source.name)}</option>`).join('')}</select></label>` : '';
+  $('#content').innerHTML = `${shell(title, subtitle, `${channelFilter}${sortControl(queueSorts, defaultSort)}${bulk}`)}${videoRows(data.items, action)}${paging(data)}</div>`;
 }
 async function renderKeywords() {
   const sources = await api('/api/sources');
@@ -114,7 +117,7 @@ $('#content').addEventListener('click', async e => {
   const type = e.target.closest('[data-type]'); if (type) { state.sourceType = type.dataset.type; return render().catch(err => toast(err.message, true)); }
   const page = e.target.closest('[data-page]'); if (page) { state.page = Number(page.dataset.page); return render().catch(err => toast(err.message, true)); }
   if (e.target.id === 'addSource') return showSource();
-  if (e.target.id === 'bulkApprove') { const items = await api('/api/queue?approvalStatus=PENDING&page=1&limit=100'); if (!items.items.length) return toast('No pending approvals'); const result = await api('/api/queue/bulk-approve', { method: 'POST', body: JSON.stringify({ ids: items.items.map(x => x._id) }) }); toast(`Approved ${result.modified} videos`); return render(); }
+  if (e.target.id === 'bulkApprove') { const params = new URLSearchParams({ approvalStatus: 'PENDING', page: String(state.page), limit: String(state.limit) }); if (state.approvalChannelId) params.set('sourceId', state.approvalChannelId); const items = await api(`/api/queue?${params}`); if (!items.items.length) return toast('No pending approvals'); const result = await api('/api/queue/bulk-approve', { method: 'POST', body: JSON.stringify({ ids: items.items.map(x => x._id) }) }); toast(`Approved ${result.modified} videos`); return render(); }
   const btn = e.target.closest('[data-act]'); if (!btn) return;
   try {
     const id = btn.dataset.id;
@@ -142,6 +145,7 @@ $('#content').addEventListener('input', e => {
   if (empty) empty.hidden = visible > 0;
 });
 $('#content').addEventListener('change', e => { if (!e.target.matches('[data-sort]')) return; state.sorts[state.view] = e.target.value; state.page = 1; render().catch(err => toast(err.message, true)); });
+$('#content').addEventListener('change', e => { if (e.target.id !== 'approvalChannelFilter') return; state.approvalChannelId = e.target.value; state.page = 1; render().catch(err => toast(err.message, true)); });
 $('#content').addEventListener('change', async e => { if (e.target.id === 'keywordSource') { try { const sources = await api('/api/sources'); const source = sources.find(s => s._id === e.target.value); if (source) await fillKeywords(source); } catch (err) { toast(err.message, true); } } });
 $('#sourceForm').addEventListener('submit', async e => { e.preventDefault(); const f = e.currentTarget; const body = { name: f.elements.name.value.trim(), url: f.elements.url.value.trim(), type: f.elements.type.value, priority: f.elements.priority.value, matchMode: f.elements.matchMode.value, enabled: f.elements.enabled.checked, videosPerScan: Number(f.elements.videosPerScan.value), scanDescription: f.elements.scanDescription.checked || f.elements.generateNfo.checked, generateNfo: f.elements.generateNfo.checked, thumbnailGeminiEnabled: f.elements.thumbnailGeminiEnabled.checked, autoApproveVideos: f.elements.type.value === 'channel' && f.elements.autoApproveVideos.checked, keywords: splitWords(f.elements.keywords.value), excludeKeywords: splitWords(f.elements.excludeKeywords.value) }; try { const id = f.elements.id.value; await api(id ? `/api/sources/${id}` : '/api/sources', { method: id ? 'PUT' : 'POST', body: JSON.stringify(body) }); $('#sourceDialog').close(); toast(id ? 'Source updated' : 'Source added'); await render(); } catch (err) { toast(err.message, true); } });
 $('#content').addEventListener('submit', async e => {
