@@ -68,7 +68,23 @@ function requestedSort(req, allowed, fallback) {
 app.get('/api/health', (_req, res) => res.json({ ok: true, database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 app.get('/api/sources', async (_req, res, next) => { try { res.json(await Source.find().sort({ type: 1, name: 1 }).lean()); } catch (e) { next(e); } });
 app.post('/api/sources', async (req, res, next) => { try { res.status(201).json(await Source.create(sourceInput(req.body))); } catch (e) { next(e); } });
-app.put('/api/sources/:id/visual-reference', express.raw({ type: ['image/jpeg', 'image/png', 'image/webp'], limit: '8mb' }), async (req, res, next) => { try { objectId(req.params.id); if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(415).json({ error: 'Upload a JPEG, PNG, or WebP reference image' }); const mimeType = String(req.headers['content-type'] || '').split(';')[0].toLowerCase(); const source = await Source.findByIdAndUpdate(req.params.id, { $set: { visualReferenceImage: req.body, visualReferenceMimeType: mimeType, geminiLastScannedVideoId: '' } }, { new: true }).select('visualReferenceMimeType visualMatchEnabled'); if (!source) return res.status(404).json({ error: 'Source not found' }); res.json({ visualReferenceMimeType: source.visualReferenceMimeType, visualMatchEnabled: source.visualMatchEnabled }); } catch (e) { next(e); } });
+app.put('/api/sources/:id/visual-reference', express.raw({ type: ['image/jpeg', 'image/png', 'image/webp'], limit: '8mb' }), async (req, res, next) => {
+  try {
+    objectId(req.params.id);
+    if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(415).json({ error: 'Upload a JPEG, PNG, or WebP reference image' });
+    const mimeType = String(req.headers['content-type'] || '').split(';')[0].toLowerCase();
+    const expectedBytes = req.body.length;
+    const source = await Source.findByIdAndUpdate(req.params.id, { $set: { visualReferenceImage: req.body, visualReferenceMimeType: mimeType, geminiLastScannedVideoId: '' } }, { new: true }).select('+visualReferenceImage visualReferenceMimeType visualMatchEnabled');
+    if (!source) return res.status(404).json({ error: 'Source not found' });
+    const savedBytes = source.visualReferenceImage?.length || 0;
+    if (savedBytes !== expectedBytes) {
+      logger.error('visual_reference_image_save_failed', { sourceId: req.params.id, sourceName: source.name, mimeType, expectedBytes, savedBytes });
+      return res.status(500).json({ error: 'The reference image was not saved completely. Please upload it again.' });
+    }
+    logger.info('visual_reference_image_saved', { sourceId: req.params.id, sourceName: source.name, mimeType, bytes: savedBytes });
+    res.json({ visualReferenceMimeType: source.visualReferenceMimeType, visualMatchEnabled: source.visualMatchEnabled, bytes: savedBytes });
+  } catch (e) { next(e); }
+});
 app.delete('/api/sources/:id/visual-reference', async (req, res, next) => { try { objectId(req.params.id); const source = await Source.findByIdAndUpdate(req.params.id, { $set: { visualReferenceMimeType: '', visualMatchEnabled: false, geminiLastScannedVideoId: '' }, $unset: { visualReferenceImage: 1 } }, { new: true }).select('visualReferenceMimeType visualMatchEnabled'); if (!source) return res.status(404).json({ error: 'Source not found' }); res.json({ visualReferenceMimeType: '', visualMatchEnabled: false }); } catch (e) { next(e); } });
 app.put('/api/sources/:id', async (req, res, next) => { try { objectId(req.params.id); const updates = sourceInput(req.body, true); const current = await Source.findById(req.params.id).select('type visualReferenceMimeType visualMatchEnabled'); if (!current) return res.status(404).json({ error: 'Source not found' }); if ((updates.type || current.type) !== 'channel' && updates.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 }); if (updates.visualMatchEnabled === true && !current.visualReferenceMimeType) throw Object.assign(new Error('Upload a reference image before enabling visual matching'), { status: 400 }); if (updates.visualMatchEnabled === true && !current.visualMatchEnabled) updates.geminiLastScannedVideoId = ''; const source = await Source.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true, runValidators: true }); res.json(source); } catch (e) { next(e); } });
 app.delete('/api/sources/:id', async (req, res, next) => { try { objectId(req.params.id); const source = await Source.findByIdAndDelete(req.params.id); if (!source) return res.status(404).json({ error: 'Source not found' }); res.json({ deleted: true }); } catch (e) { next(e); } });

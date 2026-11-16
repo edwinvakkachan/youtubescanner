@@ -106,9 +106,14 @@ async function scanNewGeminiThumbnails(source, entries) {
   let visualReference = null;
   if (source.visualMatchEnabled) {
     try {
-      const storedSource = await Source.findById(source._id).select('+visualReferenceImage visualReferenceMimeType').lean();
-      if (!storedSource?.visualReferenceImage || !storedSource.visualReferenceMimeType) throw new Error('Visual matching is enabled but its reference image is missing');
+      const storedSource = await Source.findById(source._id).select('+visualReferenceImage visualReferenceMimeType');
+      const storedImageBytes = storedSource?.visualReferenceImage?.length || 0;
+      if (!storedImageBytes || !storedSource.visualReferenceMimeType) {
+        logger.error('visual_reference_image_missing', { sourceId: String(source._id), sourceName: source.name, mimeType: storedSource?.visualReferenceMimeType || null, bytes: storedImageBytes, hint: 'Visual matching is enabled but MongoDB has no saved reference image. Re-upload the reference image in source settings.' });
+        throw new Error('Visual matching is enabled but its saved reference image is missing');
+      }
       visualReference = { image: Buffer.from(storedSource.visualReferenceImage), mimeType: storedSource.visualReferenceMimeType };
+      logger.info('visual_reference_image_loaded', { sourceId: String(source._id), sourceName: source.name, mimeType: visualReference.mimeType, bytes: visualReference.image.length });
     } catch (err) {
       return { results, skippedIds: new Set(), attempted: 0, error: { youtubeId: null, message: err.message } };
     }
