@@ -2,6 +2,16 @@
 const $ = s => document.querySelector(s);
 const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', sourceSearch: '', timer: null, sorts: {} };
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
+function applyTheme(theme, persist = true) {
+  const selected = theme === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = selected;
+  const button = $('#themeToggle');
+  if (button) {
+    button.textContent = selected === 'dark' ? '☀ Light mode' : '☾ Dark mode';
+    button.setAttribute('aria-label', `Switch to ${selected === 'dark' ? 'light' : 'dark'} mode`);
+  }
+  if (persist) { try { localStorage.setItem('tube-scout-theme', selected); } catch {} }
+}
 async function api(url, options = {}) {
   const response = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options });
   let body; try { body = await response.json(); } catch { body = {}; }
@@ -97,6 +107,8 @@ async function fillKeywords(source) {
   $('#clearKeywords').onclick = async () => { await api(`/api/sources/${source._id}`, { method: 'PUT', body: JSON.stringify({ keywords: [], excludeKeywords: [] }) }); toast('All keywords cleared'); await render(); };
 }
 $('#nav').addEventListener('click', e => { const b = e.target.closest('[data-view]'); if (!b) return; state.view = b.dataset.view; state.page = 1; render().catch(err => toast(err.message, true)); });
+$('#themeToggle').addEventListener('click', () => applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'));
+applyTheme(document.documentElement.dataset.theme || 'dark', false);
 $('#content').addEventListener('click', async e => {
   const goto = e.target.closest('[data-goto]'); if (goto) { state.view = goto.dataset.goto; state.page = 1; return render().catch(err => toast(err.message, true)); }
   const type = e.target.closest('[data-type]'); if (type) { state.sourceType = type.dataset.type; return render().catch(err => toast(err.message, true)); }
