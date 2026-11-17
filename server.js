@@ -207,15 +207,49 @@ app.get('/api/adaptive/:sourceId', async (req, res, next) => {
 app.delete('/api/sources/:id', async (req, res, next) => {
   try {
     objectId(req.params.id);
-    const current = await Source.findById(req.params.id).select('visualReferences +visualReferenceFileId');
+    const current = await Source.findById(req.params.id).select('name visualReferences +visualReferenceFileId');
     if (!current) return res.status(404).json({ error: 'Source not found' });
-    await Source.deleteOne({ _id: req.params.id });
+    const sourceId = current._id;
     const fileIds = [...(current.visualReferences || []).map(ref => ref.fileId), current.visualReferenceFileId].filter(Boolean);
     for (const fileId of fileIds) {
       try { await imagekit.deleteFile(fileId); }
       catch (err) { logger.warn('visual_reference_image_delete_failed', { sourceId: req.params.id, sourceName: current.name, provider: 'imagekit', fileId, message: err.message }); }
     }
-    res.json({ deleted: true });
+
+    // Remove this source's attribution from shared queue entries. Keep a queued
+    // video when another source still references it; remove videos discovered
+    // only by the deleted source.
+    const queueItems = await QueuedVideo.find({ 'discoveredSources.sourceId': sourceId }).lean();
+    for (const item of queueItems) {
+      const remainingSources = (item.discoveredSources || []).filter(source => String(source.sourceId) !== String(sourceId));
+      if (!remainingSources.length) {
+        await QueuedVideo.deleteOne({ _id: item._id });
+        continue;
+      }
+      const matchedKeywords = [...new Set(remainingSources.flatMap(source => source.matchedKeywords || []))];
+      const priorityRank = { HIGH: 1, NORMAL: 2, LOW: 3 };
+      const bestPriority = remainingSources.reduce((best, source) => Math.min(best, priorityRank[source.priority] || 2), 3);
+      const priority = priorities[bestPriority - 1] || 'LOW';
+      await QueuedVideo.updateOne({ _id: item._id }, { $set: {
+        discoveredSources: remainingSources, matchedKeywords, priority, priorityRank: bestPriority
+      } });
+    }
+
+    const [history, adaptiveVideos, profile, rankings, stats] = await Promise.all([
+      ScanHistory.deleteMany({ sourceId }),
+      AdaptiveVideo.deleteMany({ sourceId }),
+      ChannelProfile.deleteMany({ sourceId }),
+      ChannelRanking.deleteMany({ sourceId }),
+      VideoStatsHistory.deleteMany({ sourceId })
+    ]);
+    await Source.deleteOne({ _id: sourceId });
+    logger.info('source_and_related_data_deleted', {
+      sourceId: req.params.id, sourceName: current.name, queueItems: queueItems.length,
+      scanHistory: history.deletedCount, adaptiveVideos: adaptiveVideos.deletedCount,
+      channelProfiles: profile.deletedCount, channelRankings: rankings.deletedCount,
+      videoStatsHistory: stats.deletedCount, referenceImages: fileIds.length
+    });
+    res.json({ deleted: true, relatedDataDeleted: true });
   } catch (e) { next(e); }
 });
 app.get('/api/queue', async (req, res, next) => { try {
