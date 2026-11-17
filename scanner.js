@@ -131,11 +131,29 @@ async function scanNewGeminiThumbnails(source, entries) {
       let refs = (storedSource?.visualReferences || []).map(ref => ({ _id: ref._id, fileId: ref.fileId, url: ref.url, mimeType: ref.mimeType, bytes: ref.bytes || 0 }));
       if (!refs.length && storedSource?.visualReferenceFileId && storedSource?.visualReferenceUrl) {
         refs = [{ fileId: storedSource.visualReferenceFileId, url: storedSource.visualReferenceUrl, mimeType: storedSource.visualReferenceMimeType, bytes: 0 }];
+      } else if (!refs.length && storedSource?.visualReferenceUrl) {
+        // Older source records can retain the ImageKit URL while lacking the
+        // file ID required by the current visualReferences schema. The UI can
+        // still display that URL, so recover and migrate it before declaring
+        // the reference missing.
+        const legacy = await imagekit.downloadReferenceImage(storedSource.visualReferenceUrl);
+        const uploaded = await imagekit.uploadReferenceImage({ image: legacy.image, mimeType: legacy.mimeType, sourceId: source._id });
+        refs = [{ ...uploaded, bytes: legacy.image.length }];
+        logger.info('visual_reference_image_migrated_to_imagekit', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', fileId: uploaded.fileId, mimeType: uploaded.mimeType, bytes: legacy.image.length, recoveredFromUrl: true });
       } else if (!refs.length && storedSource?.visualReferenceImage?.length && storedSource.visualReferenceMimeType) {
         const legacy = Buffer.from(storedSource.visualReferenceImage);
         const uploaded = await imagekit.uploadReferenceImage({ image: legacy, mimeType: storedSource.visualReferenceMimeType, sourceId: source._id });
         refs = [{ ...uploaded, bytes: legacy.length }];
         logger.info('visual_reference_image_migrated_to_imagekit', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', fileId: uploaded.fileId, mimeType: storedSource.visualReferenceMimeType, bytes: legacy.length });
+      }
+      for (let index = 0; index < refs.length; index++) {
+        const reference = refs[index];
+        if (reference.fileId && reference.url && reference.mimeType) continue;
+        if (!reference.url) continue;
+        const legacy = await imagekit.downloadReferenceImage(reference.url);
+        const uploaded = await imagekit.uploadReferenceImage({ image: legacy.image, mimeType: legacy.mimeType, sourceId: source._id });
+        refs[index] = { ...uploaded, bytes: legacy.image.length };
+        logger.info('visual_reference_image_migrated_to_imagekit', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', fileId: uploaded.fileId, mimeType: uploaded.mimeType, bytes: legacy.image.length, recoveredIncompleteRecord: true });
       }
       if (!refs.length || refs.length > 10 || refs.some(ref => !ref.fileId || !ref.url || !ref.mimeType)) {
         logger.error('visual_reference_image_missing', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', referenceCount: refs.length, hint: 'Visual matching is enabled but valid saved reference images are unavailable. Re-upload the reference images in source settings.' });
@@ -298,7 +316,13 @@ async function scanSource(source) {
     if (source.thumbnailGeminiEnabled === true || source.visualMatchEnabled === true) {
       geminiResults = await scanNewGeminiThumbnails(source, entries.slice(0, limit));
       geminiAttempted = geminiResults.attempted;
-      if (geminiResults.error) logger.warn('thumbnail_gemini_failed', { sourceId: sourceKey, sourceName: source.name, youtubeId: geminiResults.error.youtubeId, message: geminiResults.error.message, hint: 'This thumbnail was skipped and the cursor advanced. Toggle Gemini off and on to reset the cursor and retry it; verify GEMINI_API_KEY and Gemini API access.' });
+      if (geminiResults.error) {
+        const retryHint = geminiResults.error.youtubeId
+          ? 'This thumbnail was skipped and the cursor advanced. Toggle Gemini off and on to reset the cursor and retry it; verify GEMINI_API_KEY and Gemini API access.'
+          : 'Reference-image loading failed before thumbnail analysis; the Gemini cursor was not advanced. Check the saved ImageKit reference and credentials, then scan again.';
+        errors.push(`Gemini: ${geminiResults.error.message}`);
+        logger.warn('thumbnail_gemini_failed', { sourceId: sourceKey, sourceName: source.name, youtubeId: geminiResults.error.youtubeId, message: geminiResults.error.message, hint: retryHint });
+      }
     }
     for (const entry of entries.slice(0, limit)) {
       const id = videoId(entry); if (!id) continue;
