@@ -1,6 +1,6 @@
 'use strict';
 const $ = s => document.querySelector(s);
-const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', sourceSearch: '', sourceSearchRegex: false, approvalChannelId: '', timer: null, sorts: {} };
+const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', sourceSearch: '', sourceSearchRegex: false, approvalChannelId: '', timer: null, sorts: {}, trendingFilters: { sourceId: '', contentType: '', importStatus: '', sort: 'viewVelocityPerDay:desc' } };
 let visualPreviewUrls = [];
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
 function applyTheme(theme, persist = true) {
@@ -116,9 +116,29 @@ async function renderAdaptiveRankings(sourceId) {
 async function renderTrending() {
   const data = await api('/api/trending');
   $('#heading').textContent = 'Trending videos'; $('#crumb').textContent = 'WORKSPACE / VIEW SURGES';
-  const rows = data.items || [];
-  const body = rows.length ? `<div class="tablewrap"><table><thead><tr><th>Video</th><th>Channel</th><th>Views</th><th>View change / day</th><th>Likes</th><th>Like change / day</th><th>Surge threshold / day</th><th>Detected</th><th>Import</th></tr></thead><tbody>${rows.map(item => `<tr><td><div class="videocell"><img class="thumb" src="${escapeHtml(item.thumbnail || '')}" alt=""><a class="title" href="${escapeHtml(item.videoUrl || `https://www.youtube.com/watch?v=${item.youtubeId}`)}" target="_blank" rel="noopener">${escapeHtml(item.title || item.youtubeId)}</a></div></td><td>${escapeHtml(item.channelName || '—')}</td><td>${item.views == null ? '—' : Number(item.views).toLocaleString()}</td><td>${item.viewVelocityPerDay == null ? '—' : Math.round(item.viewVelocityPerDay).toLocaleString()}</td><td>${item.likes == null ? '—' : Number(item.likes).toLocaleString()}</td><td>${item.lastDailyLikeGrowth == null ? '—' : Math.round(item.lastDailyLikeGrowth).toLocaleString()}</td><td>${item.surgeThresholdPerDay == null ? '—' : Math.round(item.surgeThresholdPerDay).toLocaleString()}</td><td>${item.viewSurgeDetectedAt ? new Date(item.viewSurgeDetectedAt).toLocaleString() : '—'}</td><td>${escapeHtml(item.queueStatus || 'NOT_QUEUED')}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty"><strong>No view surges detected</strong>Trending scans store the latest 90 videos first. Surges appear when a video’s daily view rate rises above its channel-specific baseline.</div>';
-  $('#content').innerHTML = `${shell('Trending videos', `Only detected view surges are listed. Likes are tracked when YouTube provides them; public dislike counts are unavailable. ${data.sources?.map(source => `${escapeHtml(source.name)}: 15-day upload forecast ${source.projectedUploadsNext15Days ?? '—'} videos${source.uploadRateReliable ? '' : ' (building reliable history)'}`).join(' · ') || ''}`, '<button class="button" id="refreshTrending">Refresh</button>')}<div class="panel">${body}</div></div>`;
+  const filters = state.trendingFilters;
+  const allRows = data.items || [];
+  const statusParts = item => { const value = String(item.queueStatus || 'NOT_QUEUED'); return value === 'NOT_QUEUED' ? ['NOT_QUEUED', 'NOT_QUEUED'] : value.split('/'); };
+  const matchesStatus = (item, filter) => {
+    if (!filter) return true;
+    const [approvalStatus, importStatus] = statusParts(item);
+    return filter === 'NOT_QUEUED' ? importStatus === 'NOT_QUEUED' : filter === approvalStatus || filter === importStatus;
+  };
+  const rows = allRows.filter(item => (!filters.sourceId || String(item.sourceId) === filters.sourceId)
+    && (!filters.contentType || item.contentType === filters.contentType)
+    && matchesStatus(item, filters.importStatus));
+  const [sortKey, sortDirection] = (filters.sort || 'viewVelocityPerDay:desc').split(':');
+  rows.sort((a, b) => {
+    const left = a[sortKey]; const right = b[sortKey];
+    const order = sortDirection === 'asc' ? 1 : -1;
+    if (typeof left === 'string' || typeof right === 'string') return String(left || '').localeCompare(String(right || '')) * order;
+    return ((Number(left ?? -Infinity) - Number(right ?? -Infinity)) * order) || String(a.youtubeId).localeCompare(String(b.youtubeId));
+  });
+  const filterOptions = `<div class="toolbar trending-filters"><label class="source-filter">Channel <select data-trending-filter="sourceId"><option value="">All channels</option>${(data.sources || []).map(source => `<option value="${escapeHtml(source.sourceId)}" ${filters.sourceId === String(source.sourceId) ? 'selected' : ''}>${escapeHtml(source.name)}</option>`).join('')}</select></label><label class="source-filter">Type <select data-trending-filter="contentType"><option value="">Videos and Shorts</option><option value="video" ${filters.contentType === 'video' ? 'selected' : ''}>Videos</option><option value="short" ${filters.contentType === 'short' ? 'selected' : ''}>Shorts</option></select></label><label class="source-filter">Import status <select data-trending-filter="importStatus"><option value="">All statuses</option><option value="NOT_QUEUED" ${filters.importStatus === 'NOT_QUEUED' ? 'selected' : ''}>Not queued</option><option value="AWAITING_APPROVAL" ${filters.importStatus === 'AWAITING_APPROVAL' ? 'selected' : ''}>Awaiting approval</option><option value="APPROVED" ${filters.importStatus === 'APPROVED' ? 'selected' : ''}>Approved</option><option value="REJECTED" ${filters.importStatus === 'REJECTED' ? 'selected' : ''}>Rejected</option><option value="PENDING" ${filters.importStatus === 'PENDING' ? 'selected' : ''}>Pending import</option><option value="PROCESSING" ${filters.importStatus === 'PROCESSING' ? 'selected' : ''}>Processing</option><option value="SENT" ${filters.importStatus === 'SENT' ? 'selected' : ''}>Sent</option><option value="PROCESSED" ${filters.importStatus === 'PROCESSED' ? 'selected' : ''}>Processed</option><option value="FAILED" ${filters.importStatus === 'FAILED' ? 'selected' : ''}>Failed</option></select></label><label class="sort-control">Sort by <select data-trending-sort><option value="viewVelocityPerDay:desc" ${filters.sort === 'viewVelocityPerDay:desc' ? 'selected' : ''}>Fastest view growth</option><option value="views:desc" ${filters.sort === 'views:desc' ? 'selected' : ''}>Most views</option><option value="likes:desc" ${filters.sort === 'likes:desc' ? 'selected' : ''}>Most likes</option><option value="lastDailyLikeGrowth:desc" ${filters.sort === 'lastDailyLikeGrowth:desc' ? 'selected' : ''}>Largest daily like gain</option><option value="publishedAt:desc" ${filters.sort === 'publishedAt:desc' ? 'selected' : ''}>Newest upload</option><option value="viewSurgeDetectedAt:desc" ${filters.sort === 'viewSurgeDetectedAt:desc' ? 'selected' : ''}>Recently detected</option><option value="channelName:asc" ${filters.sort === 'channelName:asc' ? 'selected' : ''}>Channel A–Z</option></select></label></div>`;
+  const badgeStatus = (value, title) => `<span class="badge ${escapeHtml(value)}" title="${escapeHtml(title)}">${escapeHtml(value.replaceAll('_', ' '))}</span>`;
+  const body = rows.length ? `<div class="tablewrap"><table class="trending-table"><thead><tr><th>Video</th><th>Channel</th><th>Views</th><th>View change / day</th><th>Likes</th><th>Like change / day</th><th>Surge threshold / day</th><th>Detected</th><th>Import status</th></tr></thead><tbody>${rows.map(item => { const [approvalStatus, importStatus] = statusParts(item); return `<tr><td><div class="videocell"><img class="thumb" src="${escapeHtml(item.thumbnail || '')}" onerror="this.style.visibility='hidden'" alt=""><a class="title" href="${escapeHtml(item.videoUrl || `https://www.youtube.com/watch?v=${item.youtubeId}`)}" target="_blank" rel="noopener">${escapeHtml(item.title || item.youtubeId)}</a></div></td><td>${escapeHtml(item.channelName || '—')}</td><td>${item.views == null ? '—' : Number(item.views).toLocaleString()}</td><td>${item.viewVelocityPerDay == null ? '—' : Math.round(item.viewVelocityPerDay).toLocaleString()}</td><td>${item.likes == null ? '—' : Number(item.likes).toLocaleString()}</td><td>${item.lastDailyLikeGrowth == null ? '—' : Math.round(item.lastDailyLikeGrowth).toLocaleString()}</td><td>${item.surgeThresholdPerDay == null ? '—' : Math.round(item.surgeThresholdPerDay).toLocaleString()}</td><td>${item.viewSurgeDetectedAt ? new Date(item.viewSurgeDetectedAt).toLocaleString() : '—'}</td><td><div class="status-pair">${approvalStatus === 'NOT_QUEUED' ? badgeStatus('NOT_QUEUED', 'Import status') : `<span class="status-line"><small>Approval</small>${badgeStatus(approvalStatus, 'Approval status')}</span><span class="status-line"><small>Import</small>${badgeStatus(importStatus, 'Import status')}</span>`}</div></td></tr>`; }).join('')}</tbody></table></div>` : `<div class="empty"><strong>${allRows.length ? 'No surges match these filters' : 'No view surges detected'}</strong>${allRows.length ? 'Change or clear a filter to see other detected surges.' : 'Trending scans store the latest 90 videos first. Surges appear when a video’s daily view rate rises above its channel-specific baseline.'}</div>`;
+  const sourceSummary = (data.sources || []).map(source => `${escapeHtml(source.name)}: 15-day upload forecast ${source.projectedUploadsNext15Days ?? '—'} videos${source.uploadRateReliable ? '' : ' (building reliable history)'}`).join(' · ');
+  $('#content').innerHTML = `${shell('Trending videos', `Only detected view surges are listed. Likes are tracked when YouTube provides them; public dislike counts are unavailable. ${sourceSummary}`, '<button class="button" id="refreshTrending">Refresh</button>')}${filterOptions}<div class="panel">${body}</div></div>`;
 }
 const views = {
   approval: ['Pending Approval', 'Review matches before the importer can retrieve them', { approvalStatus: 'PENDING' }],
@@ -321,6 +341,16 @@ $('#content').addEventListener('change', e => {
   applySourceSearch();
 });
 $('#content').addEventListener('change', e => { if (!e.target.matches('[data-sort]')) return; state.sorts[state.view] = e.target.value; state.page = 1; render().catch(err => toast(err.message, true)); });
+$('#content').addEventListener('change', e => {
+  if (e.target.matches('[data-trending-filter]')) {
+    state.trendingFilters[e.target.dataset.trendingFilter] = e.target.value;
+    return renderTrending().catch(err => toast(err.message, true));
+  }
+  if (e.target.matches('[data-trending-sort]')) {
+    state.trendingFilters.sort = e.target.value;
+    return renderTrending().catch(err => toast(err.message, true));
+  }
+});
 $('#content').addEventListener('change', e => { if (e.target.id !== 'approvalChannelFilter') return; state.approvalChannelId = e.target.value; state.page = 1; render().catch(err => toast(err.message, true)); });
 $('#content').addEventListener('change', async e => { if (e.target.id === 'keywordSource') { try { const sources = await api('/api/sources'); const source = sources.find(s => s._id === e.target.value); if (source) await fillKeywords(source); } catch (err) { toast(err.message, true); } } });
 $('#sourceForm').addEventListener('submit', async e => {

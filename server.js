@@ -221,7 +221,7 @@ app.get('/api/trending', async (_req, res, next) => {
     const profileById = new Map(profiles.map(profile => [String(profile.sourceId), profile]));
     const queueById = new Map(queueItems.map(item => [item.youtubeId, `${item.approvalStatus}/${item.status}`]));
     res.json({
-      sources: sources.map(source => ({ name: source.name, lastScanAt: source.adaptiveLastRunAt, ...(profileById.get(String(source._id)) || {}) })),
+      sources: sources.map(source => ({ sourceId: String(source._id), name: source.name, lastScanAt: source.adaptiveLastRunAt, ...(profileById.get(String(source._id)) || {}) })),
       items: items.map(item => ({ ...item, channelName: item.channelName || sourceById.get(String(item.sourceId))?.name || '', queueStatus: queueById.get(item.youtubeId) || 'NOT_QUEUED' }))
     });
   } catch (error) { next(error); }
