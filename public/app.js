@@ -160,6 +160,7 @@ function showSource(source = null) {
   form.elements.autoApproveVideos.checked = source?.autoApproveVideos ?? false;
   form.elements.videosPerScan.value = source?.videosPerScan || 50;
   form.elements.adaptiveDiscoveryEnabled.checked = source?.adaptiveDiscoveryEnabled ?? false;
+  form.elements.adaptiveContentType.value = source?.adaptiveContentType ?? 'BOTH';
   form.elements.generateNfo.checked = source?.generateNfo ?? false;
   form.elements.thumbnailGeminiEnabled.checked = source?.thumbnailGeminiEnabled ?? false;
   form.elements.keywordSearchMode.value = source?.keywordSearchMode ?? 'TEXT';
@@ -182,6 +183,7 @@ function showSource(source = null) {
   $('#autoApproveField').hidden = form.elements.type.value !== 'channel';
   $('#adaptiveDiscoveryField').hidden = form.elements.type.value !== 'channel';
   $('#adaptiveDiscoveryHelp').hidden = form.elements.type.value !== 'channel';
+  $('#adaptiveContentTypeField').hidden = form.elements.type.value !== 'channel' || !form.elements.adaptiveDiscoveryEnabled.checked;
   form.dataset.keywordSearchMode = form.elements.keywordSearchMode.value;
   form.elements.keywords.value = formatKeywordEntries(source?.keywords || [], form.elements.keywordSearchMode.value);
   form.elements.excludeKeywords.value = formatKeywordEntries(source?.excludeKeywords || [], form.elements.keywordSearchMode.value);
@@ -189,6 +191,7 @@ function showSource(source = null) {
   $('#sourceDialog').showModal();
 }
 $('#sourceForm').elements.visualMatchEnabled.addEventListener('change', e => { $('#visualAutoApproveField').hidden = !e.target.checked || e.currentTarget.form.elements.visualMatchAction.value === 'REJECT'; $('#visualMatchActionField').hidden = !e.target.checked; });
+$('#sourceForm').elements.adaptiveDiscoveryEnabled.addEventListener('change', e => { $('#adaptiveContentTypeField').hidden = e.currentTarget.form.elements.type.value !== 'channel' || !e.target.checked; });
 $('#sourceForm').elements.visualMatchAction.addEventListener('change', e => { $('#visualAutoApproveField').hidden = !e.currentTarget.form.elements.visualMatchEnabled.checked || e.target.value === 'REJECT'; });
 $('#sourceForm').elements.keywordSearchMode.addEventListener('change', e => {
   const form = e.currentTarget.form; const oldMode = form.dataset.keywordSearchMode || 'TEXT'; const newMode = e.target.value;
@@ -227,7 +230,7 @@ $('#removeVisualReference').addEventListener('click', async () => {
     toast('All reference images removed');
   } catch (err) { toast(err.message, true); }
 });
-$('#sourceForm').elements.type.addEventListener('change', e => { $('#autoApproveField').hidden = e.target.value !== 'channel'; $('#adaptiveDiscoveryField').hidden = e.target.value !== 'channel'; $('#adaptiveDiscoveryHelp').hidden = e.target.value !== 'channel'; });
+$('#sourceForm').elements.type.addEventListener('change', e => { $('#autoApproveField').hidden = e.target.value !== 'channel'; $('#adaptiveDiscoveryField').hidden = e.target.value !== 'channel'; $('#adaptiveDiscoveryHelp').hidden = e.target.value !== 'channel'; $('#adaptiveContentTypeField').hidden = e.target.value !== 'channel' || !e.currentTarget.form.elements.adaptiveDiscoveryEnabled.checked; });
 function splitWords(s) { return s.split(',').map(x => x.trim()).filter(Boolean); }
 function parseKeywordEntries(value, mode = 'TEXT') {
   return mode === 'REGEX' ? value.split(/\r?\n/).map(part => part.trim()).filter(Boolean) : splitWords(value);
@@ -324,6 +327,7 @@ $('#sourceForm').addEventListener('submit', async e => {
     name: f.elements.name.value.trim(), url: f.elements.url.value.trim(), type: f.elements.type.value,
     priority: f.elements.priority.value, matchMode: f.elements.matchMode.value, enabled: f.elements.enabled.checked,
     adaptiveDiscoveryEnabled: f.elements.type.value === 'channel' && f.elements.adaptiveDiscoveryEnabled.checked,
+    adaptiveContentType: f.elements.adaptiveContentType.value,
     videosPerScan: Number(f.elements.videosPerScan.value), scanDescription: f.elements.scanDescription.checked || f.elements.generateNfo.checked,
     generateNfo: f.elements.generateNfo.checked, thumbnailGeminiEnabled: f.elements.thumbnailGeminiEnabled.checked,
     visualMatchEnabled: wantsVisualMatch && !images.length, visualMatchAutoApprove: f.elements.visualMatchAutoApprove.checked,

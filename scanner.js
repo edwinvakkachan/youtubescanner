@@ -107,10 +107,12 @@ function runAdaptiveFeed(source, url, contentType, target, cutoffDate) {
 }
 async function runAdaptiveDiscovery(source) {
   const target = 30; const lookbackDays = 90; const cutoffDate = new Date(Date.now() - lookbackDays * 86400000);
-  const feeds = getAdaptiveFeedUrls(source.url);
-  logger.info('adaptive_discovery_started', { sourceId: String(source._id), sourceName: source.name, candidateTarget: target, lookbackDays, feedCount: feeds.length, metadataOnly: true });
+  const allFeeds = getAdaptiveFeedUrls(source.url).map((url, index) => ({ url, contentType: index === 0 ? 'video' : 'short' }));
+  const contentType = ['BOTH', 'VIDEOS', 'SHORTS'].includes(source.adaptiveContentType) ? source.adaptiveContentType : 'BOTH';
+  const feeds = contentType === 'VIDEOS' ? allFeeds.filter(feed => feed.contentType === 'video') : contentType === 'SHORTS' ? allFeeds.filter(feed => feed.contentType === 'short') : allFeeds;
+  logger.info('adaptive_discovery_started', { sourceId: String(source._id), sourceName: source.name, candidateTarget: target, lookbackDays, contentType, feedCount: feeds.length, metadataOnly: true });
   const candidates = [];
-  for (const [index, url] of feeds.entries()) candidates.push(...await runAdaptiveFeed(source, url, index === 0 ? 'video' : 'short', target, cutoffDate));
+  for (const feed of feeds) candidates.push(...await runAdaptiveFeed(source, feed.url, feed.contentType, target, cutoffDate));
   const byId = new Map();
   for (const entry of candidates.sort((a, b) => b._adaptivePublishedAt - a._adaptivePublishedAt)) if (!byId.has(videoId(entry))) byId.set(videoId(entry), entry);
   return [...byId.values()].slice(0, target);

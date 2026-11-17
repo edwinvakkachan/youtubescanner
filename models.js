@@ -15,6 +15,7 @@ const sourceSchema = new Schema({
   type: { type: String, required: true, enum: ['channel', 'playlist', 'shorts'] },
   videosPerScan: { type: Number, default: defaultVideosPerScan, min: 1, max: 10000 },
   adaptiveDiscoveryEnabled: { type: Boolean, default: false },
+  adaptiveContentType: { type: String, enum: ['BOTH', 'VIDEOS', 'SHORTS'], default: 'BOTH' },
   adaptiveLastRunAt: { type: Date, default: null },
   scanDescription: { type: Boolean, default: true },
   thumbnailGeminiEnabled: { type: Boolean, default: false },
