@@ -280,7 +280,17 @@ $('#content').addEventListener('click', async e => {
     if (btn.dataset.act === 'toggle-gemini') { const sources = await api('/api/sources'); const s = sources.find(x => x._id === id); await api(`/api/sources/${id}`, { method: 'PUT', body: JSON.stringify({ thumbnailGeminiEnabled: !s.thumbnailGeminiEnabled }) }); toast(`Gemini thumbnail analysis ${s.thumbnailGeminiEnabled ? 'disabled' : 'enabled'}`); }
     if (btn.dataset.act === 'toggle-source') { const sources = await api('/api/sources'); const s = sources.find(x => x._id === id); await api(`/api/sources/${id}`, { method: 'PUT', body: JSON.stringify({ enabled: !s.enabled }) }); toast('Source updated'); }
     if (btn.dataset.act === 'delete-source' && confirm('Delete this source? Existing queue records and scan history will be preserved.')) { await api(`/api/sources/${id}`, { method: 'DELETE' }); toast('Source deleted'); }
-    if (btn.dataset.act === 'scan-source') { btn.disabled = true; btn.textContent = 'Scanning…'; const r = await api(`/api/scan/${id}`, { method: 'POST' }); toast(`Scan complete: ${r.matched} matches, ${r.errors} errors`); }
+    if (btn.dataset.act === 'scan-source') {
+      btn.disabled = true; btn.textContent = 'Scanning…';
+      const r = await api(`/api/scan/${id}`, { method: 'POST' });
+      const matched = r.matched ?? r.matches ?? r.result?.matched ?? r.result?.matches;
+      const errors = r.errors ?? r.errorCount ?? r.result?.errors ?? r.result?.errorCount;
+      const inspected = r.inspected ?? r.result?.inspected;
+      if (r.skipped) toast(`Scan skipped: ${r.reason || 'source was not scanned'}`);
+      else if (Number.isFinite(Number(matched)) && Number.isFinite(Number(errors))) {
+        toast(`Scan complete: ${matched} matches, ${errors} errors${Number.isFinite(Number(inspected)) ? ` (${inspected} inspected)` : ''}${r.mode === 'ADAPTIVE_TOP_10' ? ' · Adaptive Top 10' : ''}`);
+      } else toast('Scan finished, but the server returned an unrecognized result. Check Scan History for details.', true);
+    }
     await render();
   } catch (err) { toast(err.message, true); }
 });
