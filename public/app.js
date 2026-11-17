@@ -1,6 +1,7 @@
 'use strict';
 const $ = s => document.querySelector(s);
 const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', sourceSearch: '', approvalChannelId: '', timer: null, sorts: {} };
+let visualPreviewUrls = [];
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
 function applyTheme(theme, persist = true) {
   const selected = theme === 'light' ? 'light' : 'dark';
@@ -20,6 +21,21 @@ async function api(url, options = {}) {
 }
 function toast(message, error = false) { const el = $('#notice'); el.textContent = message; el.className = `notice${error ? ' error' : ''}`; el.hidden = false; clearTimeout(state.timer); state.timer = setTimeout(() => { el.hidden = true; }, 4500); }
 function badge(value) { return `<span class="badge ${escapeHtml(value)}">${escapeHtml(value)}</span>`; }
+function renderVisualReferences(saved = [], selectedFiles = []) {
+  visualPreviewUrls.forEach(url => URL.revokeObjectURL(url));
+  visualPreviewUrls = [];
+  const gallery = $('#visualReferenceGallery');
+  if (!gallery) return;
+  const savedCards = saved.map((ref, index) => `<div class="visual-reference-card"><img src="${escapeHtml(ref.url)}" alt="Reference image ${index + 1}">${ref._id ? `<button type="button" class="visual-reference-remove" data-reference-id="${escapeHtml(ref._id)}" aria-label="Remove reference image ${index + 1}">×</button>` : ''}</div>`);
+  const selectedCards = selectedFiles.map((file, index) => {
+    const url = URL.createObjectURL(file); visualPreviewUrls.push(url);
+    return `<div class="visual-reference-card visual-reference-pending"><img src="${url}" alt="Selected reference ${index + 1}"><span>${escapeHtml(file.name)}</span></div>`;
+  });
+  gallery.innerHTML = [...savedCards, ...selectedCards].join('');
+  const total = saved.length + selectedFiles.length;
+  $('#visualReferenceStatus').textContent = total ? `${saved.length} saved reference${saved.length === 1 ? '' : 's'}${selectedFiles.length ? ` · ${selectedFiles.length} selected to upload` : ''}` : 'No reference images uploaded';
+  $('#removeVisualReference').hidden = saved.length === 0;
+}
 function uniqueChannelSources(video) {
   const seen = new Set();
   return (video.discoveredSources || []).filter(source => source.type === 'channel').filter(source => {
@@ -109,27 +125,53 @@ function showSource(source = null) {
   form.elements.thumbnailGeminiEnabled.checked = source?.thumbnailGeminiEnabled ?? false;
   form.elements.visualMatchEnabled.checked = source?.visualMatchEnabled ?? false;
   form.elements.visualMatchAutoApprove.checked = source?.visualMatchAutoApprove ?? true;
-  form.dataset.hasVisualReference = String(Boolean(source?.visualReferenceMimeType));
-  $('#visualReferenceStatus').textContent = source?.visualReferenceMimeType ? `Saved reference image (${source.visualReferenceMimeType})` : 'No reference image uploaded';
-  $('#removeVisualReference').hidden = !source?.visualReferenceMimeType;
-  $('#visualAutoApproveField').hidden = !form.elements.visualMatchEnabled.checked;
+  form.elements.visualMatchAction.value = source?.visualMatchAction ?? 'ACCEPT';
+  const savedReferences = source?.visualReferences?.length ? source.visualReferences : source?.visualReferenceUrl ? [{ url: source.visualReferenceUrl, mimeType: source.visualReferenceMimeType }] : [];
+  form.dataset.hasVisualReference = String(savedReferences.length > 0 || Boolean(source?.visualReferenceMimeType));
+  form.dataset.visualReferenceCount = String(savedReferences.length);
+  form.dataset.savedVisualReferences = JSON.stringify(savedReferences);
+  renderVisualReferences(savedReferences);
+  if (!savedReferences.length && source?.visualReferenceMimeType) {
+    $('#visualReferenceStatus').textContent = 'Legacy reference saved; its thumbnail will appear after ImageKit migration';
+    $('#removeVisualReference').hidden = false;
+  }
+  $('#visualMatchActionField').hidden = !form.elements.visualMatchEnabled.checked;
+  $('#visualAutoApproveField').hidden = !form.elements.visualMatchEnabled.checked || form.elements.visualMatchAction.value === 'REJECT';
   form.elements.scanDescription.checked = source?.scanDescription !== false || form.elements.generateNfo.checked;
   for (const key of ['name', 'url', 'type', 'priority', 'matchMode']) if (source && source[key] !== undefined) form.elements[key].value = source[key];
   $('#autoApproveField').hidden = form.elements.type.value !== 'channel';
   form.elements.keywords.value = (source?.keywords || []).join(', '); form.elements.excludeKeywords.value = (source?.excludeKeywords || []).join(', '); $('#sourceDialog').showModal();
 }
-$('#sourceForm').elements.visualMatchEnabled.addEventListener('change', e => { $('#visualAutoApproveField').hidden = !e.target.checked; });
+$('#sourceForm').elements.visualMatchEnabled.addEventListener('change', e => { $('#visualAutoApproveField').hidden = !e.target.checked || e.currentTarget.form.elements.visualMatchAction.value === 'REJECT'; $('#visualMatchActionField').hidden = !e.target.checked; });
+$('#sourceForm').elements.visualMatchAction.addEventListener('change', e => { $('#visualAutoApproveField').hidden = !e.currentTarget.form.elements.visualMatchEnabled.checked || e.target.value === 'REJECT'; });
 $('#sourceForm').elements.visualReferenceFile.addEventListener('change', e => {
-  const file = e.target.files[0];
-  if (file) { $('#visualReferenceStatus').textContent = `Selected: ${file.name}`; e.currentTarget.form.elements.visualMatchEnabled.checked = true; $('#visualAutoApproveField').hidden = false; }
+  const files = [...e.target.files];
+  if (files.length) { e.currentTarget.form.elements.visualMatchEnabled.checked = true; $('#visualAutoApproveField').hidden = e.currentTarget.form.elements.visualMatchAction.value === 'REJECT'; $('#visualMatchActionField').hidden = false; }
+  const saved = e.currentTarget.form.dataset.savedVisualReferences ? JSON.parse(e.currentTarget.form.dataset.savedVisualReferences) : [];
+  renderVisualReferences(saved, files);
+});
+$('#visualReferenceGallery').addEventListener('click', async e => {
+  const button = e.target.closest('[data-reference-id]'); if (!button) return;
+  const form = $('#sourceForm'); const sourceId = form.elements.id.value; const referenceId = button.dataset.referenceId;
+  try {
+    const result = await api(`/api/sources/${sourceId}/visual-references/${referenceId}`, { method: 'DELETE' });
+    form.dataset.savedVisualReferences = JSON.stringify(result.visualReferences || []);
+    form.dataset.visualReferenceCount = String(result.visualReferences?.length || 0);
+    form.dataset.hasVisualReference = String(Boolean(result.visualReferences?.length));
+    if (!result.visualMatchEnabled) form.elements.visualMatchEnabled.checked = false;
+    renderVisualReferences(result.visualReferences || [], [...form.elements.visualReferenceFile.files]);
+    $('#visualAutoApproveField').hidden = !result.visualMatchEnabled || form.elements.visualMatchAction.value === 'REJECT'; $('#visualMatchActionField').hidden = !result.visualMatchEnabled;
+    toast('Reference image removed');
+  } catch (err) { toast(err.message, true); }
 });
 $('#removeVisualReference').addEventListener('click', async () => {
   const form = $('#sourceForm'); const id = form.elements.id.value;
   try {
     if (id && form.dataset.hasVisualReference === 'true') await api(`/api/sources/${id}/visual-reference`, { method: 'DELETE' });
     form.dataset.hasVisualReference = 'false'; form.elements.visualReferenceFile.value = ''; form.elements.visualMatchEnabled.checked = false;
-    $('#visualReferenceStatus').textContent = 'No reference image uploaded'; $('#removeVisualReference').hidden = true; $('#visualAutoApproveField').hidden = true;
-    toast('Reference image removed');
+    form.dataset.visualReferenceCount = '0'; form.dataset.savedVisualReferences = '[]';
+    renderVisualReferences(); $('#visualMatchActionField').hidden = true; $('#visualAutoApproveField').hidden = true;
+    toast('All reference images removed');
   } catch (err) { toast(err.message, true); }
 });
 $('#sourceForm').elements.type.addEventListener('change', e => { $('#autoApproveField').hidden = e.target.value !== 'channel'; });
@@ -181,30 +223,51 @@ $('#sourceForm').addEventListener('submit', async e => {
   e.preventDefault();
   const f = e.currentTarget;
   const id = f.elements.id.value;
-  const image = f.elements.visualReferenceFile.files[0];
+  let savedSourceId = id;
+  let imageUploadAttempted = false;
+  const images = [...f.elements.visualReferenceFile.files];
   const wantsVisualMatch = f.elements.visualMatchEnabled.checked;
-  if (wantsVisualMatch && !image && f.dataset.hasVisualReference !== 'true') return toast('Choose a reference image before enabling visual matching', true);
+  if (wantsVisualMatch && !images.length && f.dataset.hasVisualReference !== 'true') return toast('Choose a reference image before enabling visual matching', true);
+  const existingCount = Number(f.dataset.visualReferenceCount || '0');
+  if (existingCount + images.length > 10) return toast('A source can have up to 10 reference images', true);
+  const selectedBytes = images.reduce((sum, file) => sum + file.size, 0);
+  if (selectedBytes > 8 * 1024 * 1024) return toast('Selected reference images must total 8 MB or less', true);
   const body = {
     name: f.elements.name.value.trim(), url: f.elements.url.value.trim(), type: f.elements.type.value,
     priority: f.elements.priority.value, matchMode: f.elements.matchMode.value, enabled: f.elements.enabled.checked,
     videosPerScan: Number(f.elements.videosPerScan.value), scanDescription: f.elements.scanDescription.checked || f.elements.generateNfo.checked,
     generateNfo: f.elements.generateNfo.checked, thumbnailGeminiEnabled: f.elements.thumbnailGeminiEnabled.checked,
-    visualMatchEnabled: wantsVisualMatch && !image, visualMatchAutoApprove: f.elements.visualMatchAutoApprove.checked,
+    visualMatchEnabled: wantsVisualMatch && !images.length, visualMatchAutoApprove: f.elements.visualMatchAutoApprove.checked,
+    visualMatchAction: f.elements.visualMatchAction.value,
     autoApproveVideos: f.elements.type.value === 'channel' && f.elements.autoApproveVideos.checked,
     keywords: splitWords(f.elements.keywords.value), excludeKeywords: splitWords(f.elements.excludeKeywords.value)
   };
   try {
     const saved = await api(id ? `/api/sources/${id}` : '/api/sources', { method: id ? 'PUT' : 'POST', body: JSON.stringify(body) });
     const sourceId = id || saved._id;
-    if (image) {
-      const response = await fetch(`/api/sources/${sourceId}/visual-reference`, { method: 'PUT', headers: { 'Content-Type': image.type }, body: image });
-      let result; try { result = await response.json(); } catch { result = {}; }
-      if (!response.ok) throw new Error(result.error || `Image upload failed (${response.status})`);
-      f.dataset.hasVisualReference = 'true';
+    savedSourceId = sourceId;
+    if (images.length) {
+      let result;
+      for (let index = 0; index < images.length; index++) {
+        const image = images[index];
+        $('#visualReferenceStatus').textContent = `Uploading reference image ${index + 1} of ${images.length}…`;
+        imageUploadAttempted = true;
+        const response = await fetch(`/api/sources/${sourceId}/visual-reference`, { method: 'PUT', headers: { 'Content-Type': image.type }, body: image });
+        try { result = await response.json(); } catch { result = {}; }
+        if (!response.ok) throw new Error(result.error || `Image upload failed (${response.status})`);
+        f.dataset.savedVisualReferences = JSON.stringify(result.visualReferences || []);
+        f.dataset.visualReferenceCount = String(result.visualReferences?.length || 0);
+        f.dataset.hasVisualReference = String(Boolean(result.visualReferences?.length));
+      }
       if (wantsVisualMatch) await api(`/api/sources/${sourceId}`, { method: 'PUT', body: JSON.stringify({ visualMatchEnabled: true }) });
     }
     $('#sourceDialog').close(); toast(id ? 'Source updated' : 'Source added'); await render();
-  } catch (err) { toast(err.message, true); }
+  } catch (err) {
+    if (imageUploadAttempted && savedSourceId) {
+      try { const sources = await api('/api/sources'); const savedSource = sources.find(source => source._id === savedSourceId); if (savedSource) showSource(savedSource); } catch {}
+    }
+    toast(err.message, true);
+  }
 });
 $('#content').addEventListener('submit', async e => {
   if (e.target.id !== 'scanSettingsForm') return;

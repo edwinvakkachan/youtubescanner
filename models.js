@@ -2,6 +2,12 @@
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
 const defaultVideosPerScan = Math.min(10000, Math.max(1, Number.parseInt(process.env.VIDEOS_PER_SOURCE || '50', 10) || 50));
+const visualReferenceSchema = new Schema({
+  fileId: { type: String, required: true },
+  url: { type: String, required: true },
+  mimeType: { type: String, required: true },
+  bytes: { type: Number, default: 0 }
+});
 
 const sourceSchema = new Schema({
   name: { type: String, required: true, trim: true, maxlength: 160 },
@@ -13,9 +19,11 @@ const sourceSchema = new Schema({
   geminiLastScannedVideoId: { type: String, default: '' },
   visualMatchEnabled: { type: Boolean, default: false },
   visualMatchAutoApprove: { type: Boolean, default: true },
+  visualMatchAction: { type: String, enum: ['ACCEPT', 'REJECT'], default: 'ACCEPT' },
+  visualReferences: { type: [visualReferenceSchema], default: [] },
   visualReferenceMimeType: { type: String, default: '' },
-  visualReferenceFileId: { type: String, default: '', select: false },
-  visualReferenceUrl: { type: String, default: '', select: false },
+  visualReferenceFileId: { type: String, default: '' },
+  visualReferenceUrl: { type: String, default: '' },
   visualReferenceImage: { type: Buffer, select: false }, // Legacy field, removed after ImageKit migration.
   generateNfo: { type: Boolean, default: false },
   keywords: { type: [String], default: [] },

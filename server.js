@@ -25,6 +25,8 @@ app.use(express.static('public'));
 const priorities = ['HIGH', 'NORMAL', 'LOW'];
 const types = ['channel', 'playlist', 'shorts'];
 const matchModes = ['ANY', 'ALL'];
+const maxVisualReferences = 10;
+const maxVisualReferenceBytes = 8 * 1024 * 1024;
 const allowedUrl = value => { try { const u = new URL(value); return ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be', 'youtube.com.', 'www.youtube.com.'].includes(u.hostname) || u.hostname.endsWith('.youtube.com'); } catch { return false; } };
 function cleanKeywords(value) {
   if (value === undefined) return undefined;
@@ -34,7 +36,7 @@ function cleanKeywords(value) {
 function sourceInput(body, partial = false) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw Object.assign(new Error('JSON object required'), { status: 400 });
   const out = {};
-  for (const key of ['name', 'url', 'type', 'matchMode', 'priority', 'enabled', 'autoApproveVideos', 'visualMatchEnabled', 'visualMatchAutoApprove', 'videosPerScan', 'scanDescription', 'generateNfo', 'thumbnailGeminiEnabled', 'keywords', 'excludeKeywords']) {
+  for (const key of ['name', 'url', 'type', 'matchMode', 'priority', 'enabled', 'autoApproveVideos', 'visualMatchEnabled', 'visualMatchAutoApprove', 'visualMatchAction', 'videosPerScan', 'scanDescription', 'generateNfo', 'thumbnailGeminiEnabled', 'keywords', 'excludeKeywords']) {
     if (!(key in body)) continue;
     const value = body[key];
     if (key === 'name') { if (typeof value !== 'string' || !value.trim() || value.length > 160) throw Object.assign(new Error('Name is required (max 160 chars)'), { status: 400 }); out.name = value.trim(); }
@@ -42,6 +44,7 @@ function sourceInput(body, partial = false) {
     else if (key === 'type') { if (!types.includes(value)) throw Object.assign(new Error('Invalid source type'), { status: 400 }); out.type = value; }
     else if (key === 'matchMode') { if (!matchModes.includes(value)) throw Object.assign(new Error('matchMode must be ANY or ALL'), { status: 400 }); out.matchMode = value; }
     else if (key === 'priority') { if (!priorities.includes(value)) throw Object.assign(new Error('Invalid priority'), { status: 400 }); out.priority = value; }
+    else if (key === 'visualMatchAction') { if (!['ACCEPT', 'REJECT'].includes(value)) throw Object.assign(new Error('visualMatchAction must be ACCEPT or REJECT'), { status: 400 }); out[key] = value; }
     else if (key === 'enabled') { if (typeof value !== 'boolean') throw Object.assign(new Error('enabled must be boolean'), { status: 400 }); out.enabled = value; }
     else if (key === 'autoApproveVideos') { if (typeof value !== 'boolean') throw Object.assign(new Error('autoApproveVideos must be boolean'), { status: 400 }); out.autoApproveVideos = value; }
     else if (key === 'videosPerScan') { if (!Number.isInteger(value) || value < 1 || value > 10000) throw Object.assign(new Error('videosPerScan must be an integer from 1 to 10000'), { status: 400 }); out.videosPerScan = value; }
@@ -68,63 +71,116 @@ function requestedSort(req, allowed, fallback) {
 }
 app.get('/api/health', (_req, res) => res.json({ ok: true, database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 app.get('/api/sources', async (_req, res, next) => { try { res.json(await Source.find().sort({ type: 1, name: 1 }).lean()); } catch (e) { next(e); } });
-app.post('/api/sources', async (req, res, next) => { try { res.status(201).json(await Source.create(sourceInput(req.body))); } catch (e) { next(e); } });
+app.post('/api/sources', async (req, res, next) => {
+  try {
+    const input = sourceInput(req.body);
+    if (input.visualMatchEnabled) throw Object.assign(new Error('Save the source and upload its reference image before enabling visual matching'), { status: 400 });
+    res.status(201).json(await Source.create(input));
+  } catch (e) { next(e); }
+});
 app.put('/api/sources/:id/visual-reference', express.raw({ type: ['image/jpeg', 'image/png', 'image/webp'], limit: '8mb' }), async (req, res, next) => {
-  let uploaded;
+  const uploads = [];
   let persisted = false;
   try {
     objectId(req.params.id);
     if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(415).json({ error: 'Upload a JPEG, PNG, or WebP reference image' });
     const mimeType = String(req.headers['content-type'] || '').split(';')[0].toLowerCase();
-    const current = await Source.findById(req.params.id).select('+visualReferenceFileId');
+    const current = await Source.findById(req.params.id).select('visualReferences visualReferenceMimeType +visualReferenceFileId +visualReferenceUrl +visualReferenceImage');
     if (!current) return res.status(404).json({ error: 'Source not found' });
-    uploaded = await imagekit.uploadReferenceImage({ image: req.body, mimeType, sourceId: req.params.id });
+    const references = (current.visualReferences || []).map(ref => ({ _id: ref._id, fileId: ref.fileId, url: ref.url, mimeType: ref.mimeType, bytes: ref.bytes || 0 }));
+    if (!references.length && current.visualReferenceFileId && current.visualReferenceUrl) {
+      const legacyImage = await imagekit.downloadReferenceImage(current.visualReferenceUrl);
+      references.push({ fileId: current.visualReferenceFileId, url: current.visualReferenceUrl, mimeType: legacyImage.mimeType, bytes: legacyImage.image.length });
+    }
+    if (!references.length && current.visualReferenceImage?.length && current.visualReferenceMimeType) {
+      const legacy = Buffer.from(current.visualReferenceImage);
+      const migrated = await imagekit.uploadReferenceImage({ image: legacy, mimeType: current.visualReferenceMimeType, sourceId: req.params.id });
+      uploads.push(migrated.fileId);
+      references.push({ ...migrated, bytes: legacy.length });
+      logger.info('visual_reference_image_migrated_to_imagekit', { sourceId: req.params.id, sourceName: current.name, provider: 'imagekit', fileId: migrated.fileId, mimeType: current.visualReferenceMimeType, bytes: legacy.length });
+    }
+    if (references.length >= maxVisualReferences) return res.status(400).json({ error: `A source can have up to ${maxVisualReferences} reference images` });
+    const knownBytes = references.reduce((sum, ref) => sum + (ref.bytes || 0), 0);
+    if (knownBytes + req.body.length > maxVisualReferenceBytes) throw Object.assign(new Error('Reference images for a source must total 8 MB or less'), { status: 413 });
+    const uploaded = await imagekit.uploadReferenceImage({ image: req.body, mimeType, sourceId: req.params.id });
+    uploads.push(uploaded.fileId);
+    references.push({ ...uploaded, bytes: req.body.length });
     const source = await Source.findByIdAndUpdate(req.params.id, {
-      $set: { visualReferenceFileId: uploaded.fileId, visualReferenceUrl: uploaded.url, visualReferenceMimeType: mimeType, geminiLastScannedVideoId: '' },
-      $unset: { visualReferenceImage: 1 }
-    }, { new: true }).select('visualReferenceMimeType visualMatchEnabled +visualReferenceFileId +visualReferenceUrl');
+      $set: { visualReferences: references, visualReferenceMimeType: references[0]?.mimeType || mimeType, geminiLastScannedVideoId: '' },
+      $unset: { visualReferenceImage: 1, visualReferenceFileId: 1, visualReferenceUrl: 1 }
+    }, { new: true }).select('visualReferences visualReferenceMimeType visualMatchEnabled');
     if (!source) throw Object.assign(new Error('Source was removed before its reference image could be saved'), { status: 404 });
     persisted = true;
-    if (source.visualReferenceFileId !== uploaded.fileId || source.visualReferenceUrl !== uploaded.url) throw new Error('ImageKit returned an image but its reference was not saved to MongoDB');
-    logger.info('visual_reference_image_saved', { sourceId: req.params.id, sourceName: source.name, provider: 'imagekit', fileId: uploaded.fileId, mimeType, bytes: req.body.length });
-    if (current.visualReferenceFileId && current.visualReferenceFileId !== uploaded.fileId) {
-      try { await imagekit.deleteFile(current.visualReferenceFileId); }
-      catch (err) { logger.warn('visual_reference_image_old_file_delete_failed', { sourceId: req.params.id, sourceName: source.name, fileId: current.visualReferenceFileId, message: err.message }); }
-    }
-    res.json({ visualReferenceMimeType: source.visualReferenceMimeType, visualMatchEnabled: source.visualMatchEnabled, provider: 'imagekit' });
+    if (source.visualReferences.length !== references.length) throw new Error('ImageKit reference list was not saved completely in MongoDB');
+    logger.info('visual_reference_image_saved', { sourceId: req.params.id, sourceName: source.name, provider: 'imagekit', fileId: uploaded.fileId, mimeType, bytes: req.body.length, referenceCount: source.visualReferences.length });
+    res.json({ visualReferenceMimeType: source.visualReferenceMimeType, visualMatchEnabled: source.visualMatchEnabled, visualReferences: source.visualReferences, provider: 'imagekit' });
   } catch (e) {
-    if (uploaded?.fileId && !persisted) await imagekit.deleteFile(uploaded.fileId).catch(err => logger.warn('visual_reference_image_upload_cleanup_failed', { sourceId: req.params.id, fileId: uploaded.fileId, message: err.message }));
-    if (uploaded) logger.error('visual_reference_image_save_failed', { sourceId: req.params.id, provider: 'imagekit', message: e.message });
+    if (!persisted) for (const fileId of uploads) await imagekit.deleteFile(fileId).catch(err => logger.warn('visual_reference_image_upload_cleanup_failed', { sourceId: req.params.id, fileId, message: err.message }));
+    logger.error('visual_reference_image_save_failed', { sourceId: req.params.id, provider: 'imagekit', message: e.message });
     next(e);
   }
+});
+app.delete('/api/sources/:id/visual-references/:referenceId', async (req, res, next) => {
+  try {
+    objectId(req.params.id);
+    const current = await Source.findById(req.params.id).select('visualReferences');
+    if (!current) return res.status(404).json({ error: 'Source not found' });
+    const reference = current.visualReferences.id(req.params.referenceId);
+    if (!reference) return res.status(404).json({ error: 'Reference image not found' });
+    const fileId = reference.fileId;
+    reference.deleteOne();
+    current.visualReferenceMimeType = current.visualReferences[0]?.mimeType || '';
+    current.geminiLastScannedVideoId = '';
+    if (!current.visualReferences.length) current.visualMatchEnabled = false;
+    await current.save();
+    try { await imagekit.deleteFile(fileId); }
+    catch (err) { logger.warn('visual_reference_image_delete_failed', { sourceId: req.params.id, sourceName: current.name, provider: 'imagekit', fileId, message: err.message }); }
+    logger.info('visual_reference_image_removed', { sourceId: req.params.id, sourceName: current.name, provider: 'imagekit', fileId, referenceCount: current.visualReferences.length });
+    res.json({ visualReferenceMimeType: current.visualReferenceMimeType, visualMatchEnabled: current.visualMatchEnabled, visualReferences: current.visualReferences });
+  } catch (e) { next(e); }
 });
 app.delete('/api/sources/:id/visual-reference', async (req, res, next) => {
   try {
     objectId(req.params.id);
-    const current = await Source.findById(req.params.id).select('+visualReferenceFileId');
+    const current = await Source.findById(req.params.id).select('visualReferences +visualReferenceFileId');
     if (!current) return res.status(404).json({ error: 'Source not found' });
-    const source = await Source.findByIdAndUpdate(req.params.id, {
-      $set: { visualReferenceMimeType: '', visualMatchEnabled: false, geminiLastScannedVideoId: '' },
+    const fileIds = [...(current.visualReferences || []).map(ref => ref.fileId), current.visualReferenceFileId].filter(Boolean);
+    await Source.findByIdAndUpdate(req.params.id, {
+      $set: { visualReferences: [], visualReferenceMimeType: '', visualMatchEnabled: false, geminiLastScannedVideoId: '' },
       $unset: { visualReferenceImage: 1, visualReferenceFileId: 1, visualReferenceUrl: 1 }
-    }, { new: true }).select('visualReferenceMimeType visualMatchEnabled');
-    if (current.visualReferenceFileId) {
-      try { await imagekit.deleteFile(current.visualReferenceFileId); }
-      catch (err) { logger.warn('visual_reference_image_delete_failed', { sourceId: req.params.id, sourceName: current.name, provider: 'imagekit', fileId: current.visualReferenceFileId, message: err.message }); }
+    });
+    for (const fileId of fileIds) {
+      try { await imagekit.deleteFile(fileId); }
+      catch (err) { logger.warn('visual_reference_image_delete_failed', { sourceId: req.params.id, sourceName: current.name, provider: 'imagekit', fileId, message: err.message }); }
     }
-    logger.info('visual_reference_image_removed', { sourceId: req.params.id, sourceName: current.name, provider: current.visualReferenceFileId ? 'imagekit' : 'legacy_or_empty' });
-    res.json({ visualReferenceMimeType: '', visualMatchEnabled: false });
+    logger.info('visual_reference_image_removed', { sourceId: req.params.id, sourceName: current.name, provider: fileIds.length ? 'imagekit' : 'legacy_or_empty', referenceCount: 0 });
+    res.json({ visualReferenceMimeType: '', visualMatchEnabled: false, visualReferences: [] });
   } catch (e) { next(e); }
 });
-app.put('/api/sources/:id', async (req, res, next) => { try { objectId(req.params.id); const updates = sourceInput(req.body, true); const current = await Source.findById(req.params.id).select('type visualReferenceMimeType visualMatchEnabled'); if (!current) return res.status(404).json({ error: 'Source not found' }); if ((updates.type || current.type) !== 'channel' && updates.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 }); if (updates.visualMatchEnabled === true && !current.visualReferenceMimeType) throw Object.assign(new Error('Upload a reference image before enabling visual matching'), { status: 400 }); if (updates.visualMatchEnabled === true && !current.visualMatchEnabled) updates.geminiLastScannedVideoId = ''; const source = await Source.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true, runValidators: true }); res.json(source); } catch (e) { next(e); } });
+app.put('/api/sources/:id', async (req, res, next) => {
+  try {
+    objectId(req.params.id);
+    const updates = sourceInput(req.body, true);
+    const current = await Source.findById(req.params.id).select('type visualReferences visualReferenceMimeType visualMatchEnabled visualMatchAction');
+    if (!current) return res.status(404).json({ error: 'Source not found' });
+    if ((updates.type || current.type) !== 'channel' && updates.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 });
+    if (updates.visualMatchEnabled === true && !current.visualReferences.length && !current.visualReferenceMimeType) throw Object.assign(new Error('Upload a reference image before enabling visual matching'), { status: 400 });
+    if (updates.visualMatchEnabled === true && !current.visualMatchEnabled) updates.geminiLastScannedVideoId = '';
+    if (updates.visualMatchAction && updates.visualMatchAction !== current.visualMatchAction) updates.geminiLastScannedVideoId = '';
+    const source = await Source.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true, runValidators: true });
+    res.json(source);
+  } catch (e) { next(e); }
+});
 app.delete('/api/sources/:id', async (req, res, next) => {
   try {
     objectId(req.params.id);
-    const current = await Source.findById(req.params.id).select('+visualReferenceFileId');
+    const current = await Source.findById(req.params.id).select('visualReferences +visualReferenceFileId');
     if (!current) return res.status(404).json({ error: 'Source not found' });
     await Source.deleteOne({ _id: req.params.id });
-    if (current.visualReferenceFileId) {
-      try { await imagekit.deleteFile(current.visualReferenceFileId); }
-      catch (err) { logger.warn('visual_reference_image_delete_failed', { sourceId: req.params.id, sourceName: current.name, provider: 'imagekit', fileId: current.visualReferenceFileId, message: err.message }); }
+    const fileIds = [...(current.visualReferences || []).map(ref => ref.fileId), current.visualReferenceFileId].filter(Boolean);
+    for (const fileId of fileIds) {
+      try { await imagekit.deleteFile(fileId); }
+      catch (err) { logger.warn('visual_reference_image_delete_failed', { sourceId: req.params.id, sourceName: current.name, provider: 'imagekit', fileId, message: err.message }); }
     }
     res.json({ deleted: true });
   } catch (e) { next(e); }

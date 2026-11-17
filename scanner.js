@@ -65,7 +65,7 @@ function findMatches(source, entry, description = entry.description || '', thumb
   const matches = includes.filter(k => text.includes(k.toLocaleLowerCase()));
   return { accepted: source.matchMode === 'ALL' ? matches.length === includes.length : matches.length > 0, matches, excluded: false };
 }
-async function thumbnailTextFromUrl(url, visualReference = null) {
+async function thumbnailTextFromUrl(url, visualReferences = []) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not configured');
   const parsed = new URL(url);
@@ -77,15 +77,15 @@ async function thumbnailTextFromUrl(url, visualReference = null) {
   const mimeType = (response.headers.get('content-type') || '').split(';')[0].toLowerCase();
   if (!['image/jpeg', 'image/png', 'image/webp'].includes(mimeType)) throw new Error(`Unsupported thumbnail format: ${mimeType || 'unknown'}`);
   const image = Buffer.from(await response.arrayBuffer());
-  const parts = [{ text: visualReference
-    ? 'Compare the reference image with the YouTube thumbnail. Ignore all people and faces completely; do not compare or identify anyone. Decide whether the same non-person object or a distinctive scene shown in the reference is visibly present in the thumbnail. Also transcribe visible thumbnail text. Return JSON with boolean visual_match and string thumbnail_text. Set visual_match true only for a clear match of the same object or distinctive scene, not merely a similar category.'
+  const parts = [{ text: visualReferences.length
+    ? `Compare each of the ${visualReferences.length} reference images, in order, with the YouTube thumbnail. Ignore all people and faces completely; do not compare or identify anyone. For each reference, decide whether the same non-person object or a distinctive scene is visibly present in the thumbnail. Return JSON with matched_reference_indices (zero-based reference image indexes, empty if none) and thumbnail_text. Include an index only for a clear match, not merely a similar category. Also transcribe visible thumbnail text.`
     : 'Read and transcribe every word visible in this YouTube thumbnail. Preserve the original scripts and wording. Return only the visible text, without explanation.' }];
-  if (visualReference) parts.push({ inline_data: { mime_type: visualReference.mimeType, data: visualReference.image.toString('base64') } });
+  for (const reference of visualReferences) parts.push({ inline_data: { mime_type: reference.mimeType, data: reference.image.toString('base64') } });
   parts.push({ inline_data: { mime_type: mimeType, data: image.toString('base64') } });
   const requestBody = { contents: [{ parts }] };
-  if (visualReference) requestBody.generationConfig = {
+  if (visualReferences.length) requestBody.generationConfig = {
     responseMimeType: 'application/json',
-    responseSchema: { type: 'OBJECT', properties: { visual_match: { type: 'BOOLEAN' }, thumbnail_text: { type: 'STRING' } }, required: ['visual_match', 'thumbnail_text'] }
+    responseSchema: { type: 'OBJECT', properties: { matched_reference_indices: { type: 'ARRAY', items: { type: 'INTEGER' } }, thumbnail_text: { type: 'STRING' } }, required: ['matched_reference_indices', 'thumbnail_text'] }
   };
   const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent';
   const result = await fetch(endpoint, {
@@ -97,38 +97,46 @@ async function thumbnailTextFromUrl(url, visualReference = null) {
   if (!result.ok) throw new Error(`${payload.error?.message || 'Gemini API request failed'} (HTTP ${result.status})`);
   const responseText = payload.candidates?.[0]?.content?.parts?.map(part => part.text || '').join('\n').trim();
   if (responseText === undefined) throw new Error('Gemini returned no thumbnail analysis');
-  if (!visualReference) return { text: responseText, visualMatch: false };
+  if (!visualReferences.length) return { text: responseText, visualMatchIndices: [] };
   const analysis = JSON.parse(responseText);
-  if (typeof analysis.visual_match !== 'boolean' || typeof analysis.thumbnail_text !== 'string') throw new Error('Gemini returned an invalid visual match result');
-  return { text: analysis.thumbnail_text, visualMatch: analysis.visual_match };
+  if (!Array.isArray(analysis.matched_reference_indices) || typeof analysis.thumbnail_text !== 'string' || analysis.matched_reference_indices.some(index => !Number.isInteger(index) || index < 0 || index >= visualReferences.length)) throw new Error('Gemini returned an invalid visual match result');
+  return { text: analysis.thumbnail_text, visualMatchIndices: [...new Set(analysis.matched_reference_indices)] };
 }
 async function scanNewGeminiThumbnails(source, entries) {
   const results = new Map();
-  let visualReference = null;
+  let visualReferences = [];
   if (source.visualMatchEnabled) {
     try {
-      const storedSource = await Source.findById(source._id).select('+visualReferenceImage +visualReferenceFileId +visualReferenceUrl visualReferenceMimeType');
-      let fileId = storedSource?.visualReferenceFileId || '';
-      let imageUrl = storedSource?.visualReferenceUrl || '';
-      if ((!fileId || !imageUrl) && storedSource?.visualReferenceImage?.length && storedSource.visualReferenceMimeType) {
-        const legacyImage = Buffer.from(storedSource.visualReferenceImage);
-        const uploaded = await imagekit.uploadReferenceImage({ image: legacyImage, mimeType: storedSource.visualReferenceMimeType, sourceId: source._id });
-        await Source.updateOne({ _id: source._id }, {
-          $set: { visualReferenceFileId: uploaded.fileId, visualReferenceUrl: uploaded.url },
-          $unset: { visualReferenceImage: 1 }
+      const storedSource = await Source.findById(source._id).select('visualReferences visualReferenceMimeType +visualReferenceFileId +visualReferenceUrl +visualReferenceImage');
+      let refs = (storedSource?.visualReferences || []).map(ref => ({ _id: ref._id, fileId: ref.fileId, url: ref.url, mimeType: ref.mimeType, bytes: ref.bytes || 0 }));
+      if (!refs.length && storedSource?.visualReferenceFileId && storedSource?.visualReferenceUrl) {
+        refs = [{ fileId: storedSource.visualReferenceFileId, url: storedSource.visualReferenceUrl, mimeType: storedSource.visualReferenceMimeType, bytes: 0 }];
+      } else if (!refs.length && storedSource?.visualReferenceImage?.length && storedSource.visualReferenceMimeType) {
+        const legacy = Buffer.from(storedSource.visualReferenceImage);
+        const uploaded = await imagekit.uploadReferenceImage({ image: legacy, mimeType: storedSource.visualReferenceMimeType, sourceId: source._id });
+        refs = [{ ...uploaded, bytes: legacy.length }];
+        logger.info('visual_reference_image_migrated_to_imagekit', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', fileId: uploaded.fileId, mimeType: storedSource.visualReferenceMimeType, bytes: legacy.length });
+      }
+      if (!refs.length || refs.length > 10 || refs.some(ref => !ref.fileId || !ref.url || !ref.mimeType)) {
+        logger.error('visual_reference_image_missing', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', referenceCount: refs.length, hint: 'Visual matching is enabled but valid saved reference images are unavailable. Re-upload the reference images in source settings.' });
+        throw new Error('Visual matching is enabled but saved ImageKit reference images are missing or invalid');
+      }
+      if (!(storedSource.visualReferences || []).length) {
+        await Source.findByIdAndUpdate(source._id, {
+          $set: { visualReferences: refs, visualReferenceMimeType: refs[0].mimeType },
+          $unset: { visualReferenceImage: 1, visualReferenceFileId: 1, visualReferenceUrl: 1 }
         });
-        fileId = uploaded.fileId;
-        imageUrl = uploaded.url;
-        logger.info('visual_reference_image_migrated_to_imagekit', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', fileId, mimeType: storedSource.visualReferenceMimeType, bytes: legacyImage.length });
       }
-      if (!fileId || !imageUrl || !storedSource?.visualReferenceMimeType) {
-        logger.error('visual_reference_image_missing', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', fileId: fileId || null, urlPresent: Boolean(imageUrl), mimeType: storedSource?.visualReferenceMimeType || null, hint: 'Visual matching is enabled but no saved ImageKit reference is available. Re-upload the reference image in source settings.' });
-        throw new Error('Visual matching is enabled but its saved ImageKit reference image is missing');
+      let totalBytes = 0;
+      for (const reference of refs) {
+        const downloaded = await imagekit.downloadReferenceImage(reference.url);
+        totalBytes += downloaded.image.length;
+        if (totalBytes > 8 * 1024 * 1024) throw new Error('Saved reference images exceed the 8 MB per-source limit');
+        visualReferences.push({ ...downloaded, fileId: reference.fileId });
       }
-      visualReference = await imagekit.downloadReferenceImage(imageUrl);
-      logger.info('visual_reference_image_loaded', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', fileId, mimeType: visualReference.mimeType, bytes: visualReference.image.length });
+      logger.info('visual_reference_images_loaded', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', referenceCount: visualReferences.length, fileIds: visualReferences.map(ref => ref.fileId), bytes: totalBytes });
     } catch (err) {
-      if (!err.message.includes('saved ImageKit reference image is missing')) logger.error('visual_reference_image_load_failed', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', message: err.message });
+      if (!err.message.includes('saved ImageKit reference images are missing or invalid')) logger.error('visual_reference_images_load_failed', { sourceId: String(source._id), sourceName: source.name, provider: 'imagekit', message: err.message });
       return { results, skippedIds: new Set(), attempted: 0, error: { youtubeId: null, message: err.message } };
     }
   }
@@ -151,28 +159,27 @@ async function scanNewGeminiThumbnails(source, entries) {
     try {
       if (!thumbnail) throw new Error('No thumbnail URL in video metadata');
       attempted++;
-      logger.gemini('REQUEST', { model: 'gemini-3.1-flash-lite', sourceId: String(source._id), sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180) });
-      const analysis = await thumbnailTextFromUrl(thumbnail, visualReference);
+      logger.gemini('REQUEST', { model: 'gemini-3.1-flash-lite', sourceId: String(source._id), sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), visualReferenceCount: visualReferences.length, visualMatchAction: source.visualMatchAction || 'ACCEPT' });
+      const analysis = await thumbnailTextFromUrl(thumbnail, visualReferences);
       const keywordMatch = findMatches(source, entry, entry.description || '', analysis.text);
       const hasIncludes = (source.keywords || []).some(Boolean);
+      const visualMatch = analysis.visualMatchIndices.length > 0;
+      const action = source.visualMatchAction || 'ACCEPT';
       const accepted = keywordMatch.excluded ? false : source.visualMatchEnabled
-        ? analysis.visualMatch || (hasIncludes && keywordMatch.accepted)
+        ? action === 'REJECT' ? (!visualMatch && keywordMatch.accepted) : (visualMatch || (hasIncludes && keywordMatch.accepted))
         : keywordMatch.accepted;
       const matches = [...keywordMatch.matches];
-      if (analysis.visualMatch) matches.push('visual-reference-match');
+      if (visualMatch) matches.push('visual-reference-match');
       const match = { accepted, matches, excluded: keywordMatch.excluded };
       if (match.accepted) await upsertVideo(source, entry, match.matches);
       await Source.updateOne({ _id: source._id }, { $set: { geminiLastScannedVideoId: id } });
       source.geminiLastScannedVideoId = id;
       results.set(id, { accepted: match.accepted, matches: match.matches, text: analysis.text });
-      logger.gemini(match.accepted ? 'ACCEPTED' : 'REJECTED', { model: 'gemini-3.1-flash-lite', sourceId: String(source._id), sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), extractedText: analysis.text, visualMatch: analysis.visualMatch, matchedKeywords: match.matches, matchMode: source.matchMode || 'ANY' });
+      logger.gemini(match.accepted ? 'ACCEPTED' : 'REJECTED', { model: 'gemini-3.1-flash-lite', sourceId: String(source._id), sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), extractedText: analysis.text, visualMatch, matchedReferenceIndices: analysis.visualMatchIndices, visualMatchAction: action, matchedKeywords: match.matches, matchMode: source.matchMode || 'ANY' });
     } catch (err) {
       error = { youtubeId: id, message: err.message };
       logger.gemini('ERROR', { model: 'gemini-3.1-flash-lite', sourceId: String(source._id), sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), message: err.message });
       // Don't let one unsupported/corrupt thumbnail block all later videos.
-      // Mark it scanned so periodic scans can progress without repeatedly
-      // spending a Gemini request on the same image. Visual mode fails closed
-      // in scanSource when this ID has no successful comparison result.
       await Source.updateOne({ _id: source._id }, { $set: { geminiLastScannedVideoId: id } });
       source.geminiLastScannedVideoId = id;
     }
