@@ -14,6 +14,8 @@ const sourceSchema = new Schema({
   url: { type: String, required: true, trim: true },
   type: { type: String, required: true, enum: ['channel', 'playlist', 'shorts'] },
   videosPerScan: { type: Number, default: defaultVideosPerScan, min: 1, max: 10000 },
+  adaptiveDiscoveryEnabled: { type: Boolean, default: false },
+  adaptiveLastRunAt: { type: Date, default: null },
   scanDescription: { type: Boolean, default: true },
   thumbnailGeminiEnabled: { type: Boolean, default: false },
   geminiLastScannedVideoId: { type: String, default: '' },
@@ -82,9 +84,52 @@ const scannerSettingsSchema = new Schema({
   scanIntervalMinutes: { type: Number, default: 360, min: 1, max: 10080 }
 }, { timestamps: true, collection: 'scanner_settings' });
 
+const adaptiveVideoSchema = new Schema({
+  sourceId: { type: Schema.Types.ObjectId, required: true }, youtubeId: { type: String, required: true },
+  channelId: { type: String, default: '' }, channelName: { type: String, default: '' }, title: { type: String, default: '' },
+  description: { type: String, default: '' }, thumbnail: { type: String, default: '' }, videoUrl: { type: String, default: '' },
+  publishedAt: { type: Date, required: true }, duration: { type: Number, default: null },
+  contentType: { type: String, enum: ['video', 'short'], default: 'video' },
+  views: { type: Number, default: null }, likes: { type: Number, default: null }, comments: { type: Number, default: null },
+  engagementRate: { type: Number, default: null }, engagementIncomplete: { type: Boolean, default: true },
+  statsUpdatedAt: { type: Date, default: null }, lastDailyViewGrowth: { type: Number, default: null }
+}, { timestamps: true, collection: 'adaptive_channel_videos' });
+adaptiveVideoSchema.index({ sourceId: 1, youtubeId: 1 }, { unique: true });
+adaptiveVideoSchema.index({ sourceId: 1, publishedAt: -1 });
+
+const channelProfileSchema = new Schema({
+  sourceId: { type: Schema.Types.ObjectId, required: true, unique: true }, channelId: { type: String, default: '' }, channelName: { type: String, default: '' },
+  candidateCount: { type: Number, default: 0 }, medianViews: { type: Number, default: null }, percentile25Views: { type: Number, default: null }, percentile75Views: { type: Number, default: null },
+  averageViews: { type: Number, default: null }, medianLikes: { type: Number, default: null }, medianComments: { type: Number, default: null },
+  medianEngagementRate: { type: Number, default: null }, averageEngagementRate: { type: Number, default: null }, percentile75EngagementRate: { type: Number, default: null },
+  averageUploadsPerDay7d: { type: Number, default: 0 }, averageUploadsPerDay30d: { type: Number, default: 0 }, uploadsLast24Hours: { type: Number, default: 0 },
+  averageTimeBetweenUploadsHours: { type: Number, default: null }, averageDailyViewGrowth: { type: Number, default: null },
+  minimumViewsThreshold: { type: Number, default: null }, thresholdSampleSize: { type: Number, default: 0 }, thresholdProvisional: { type: Boolean, default: true },
+  thresholdMethod: { type: String, default: 'linear-interpolation' }, discoveryWindowDays: { type: Number, default: 90 }, calculatedAt: { type: Date, default: null }
+}, { timestamps: true, collection: 'channel_profiles' });
+
+const channelRankingSchema = new Schema({
+  sourceId: { type: Schema.Types.ObjectId, required: true }, channelId: { type: String, default: '' }, channelName: { type: String, default: '' },
+  rankingDate: { type: Date, required: true }, rankingType: { type: String, enum: ['recent', 'engagement'], required: true },
+  entries: [{ youtubeId: String, rank: Number, title: String, thumbnail: String, videoUrl: String, publishedAt: Date, views: Number, likes: Number, comments: Number, engagementRate: Number, relativeEngagement: Number, queueStatus: String }]
+}, { timestamps: true, collection: 'channel_rankings' });
+channelRankingSchema.index({ sourceId: 1, rankingDate: -1, rankingType: 1 }, { unique: true });
+
+const videoStatsHistorySchema = new Schema({
+  sourceId: { type: Schema.Types.ObjectId, required: true }, youtubeId: { type: String, required: true }, channelId: { type: String, default: '' },
+  capturedAt: { type: Date, required: true }, views: { type: Number, default: null }, likes: { type: Number, default: null }, comments: { type: Number, default: null }, engagementRate: { type: Number, default: null }
+}, { timestamps: true, collection: 'video_stats_history' });
+videoStatsHistorySchema.index({ sourceId: 1, youtubeId: 1, capturedAt: 1 }, { unique: true });
+const statsRetentionDays = Math.max(30, Number.parseInt(process.env.STATS_RETENTION_DAYS || '45', 10) || 45);
+videoStatsHistorySchema.index({ capturedAt: 1 }, { expireAfterSeconds: statsRetentionDays * 86400 });
+
 module.exports = {
   Source: mongoose.models.Source || mongoose.model('Source', sourceSchema, 'sources'),
   QueuedVideo: mongoose.models.QueuedVideo || mongoose.model('QueuedVideo', queueSchema, 'youtube_queue'),
   ScanHistory: mongoose.models.ScanHistory || mongoose.model('ScanHistory', historySchema, 'scan_history'),
-  ScannerSettings: mongoose.models.ScannerSettings || mongoose.model('ScannerSettings', scannerSettingsSchema)
+  ScannerSettings: mongoose.models.ScannerSettings || mongoose.model('ScannerSettings', scannerSettingsSchema),
+  AdaptiveVideo: mongoose.models.AdaptiveVideo || mongoose.model('AdaptiveVideo', adaptiveVideoSchema),
+  ChannelProfile: mongoose.models.ChannelProfile || mongoose.model('ChannelProfile', channelProfileSchema),
+  ChannelRanking: mongoose.models.ChannelRanking || mongoose.model('ChannelRanking', channelRankingSchema),
+  VideoStatsHistory: mongoose.models.VideoStatsHistory || mongoose.model('VideoStatsHistory', videoStatsHistorySchema)
 };

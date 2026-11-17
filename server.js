@@ -3,7 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const { connectDB } = require('./db');
-const { Source, QueuedVideo, ScanHistory, ScannerSettings } = require('./models');
+const { Source, QueuedVideo, ScanHistory, ScannerSettings, AdaptiveVideo, ChannelProfile, ChannelRanking, VideoStatsHistory } = require('./models');
 const scanner = require('./scanner');
 const scheduler = require('./scheduler');
 const logger = require('./logger');
@@ -37,7 +37,7 @@ function cleanKeywords(value) {
 function sourceInput(body, partial = false) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw Object.assign(new Error('JSON object required'), { status: 400 });
   const out = {};
-  for (const key of ['name', 'url', 'type', 'matchMode', 'priority', 'enabled', 'autoApproveVideos', 'visualMatchEnabled', 'visualMatchAutoApprove', 'visualMatchAction', 'keywordSearchMode', 'videosPerScan', 'scanDescription', 'generateNfo', 'thumbnailGeminiEnabled', 'keywords', 'excludeKeywords']) {
+  for (const key of ['name', 'url', 'type', 'matchMode', 'priority', 'enabled', 'autoApproveVideos', 'adaptiveDiscoveryEnabled', 'visualMatchEnabled', 'visualMatchAutoApprove', 'visualMatchAction', 'keywordSearchMode', 'videosPerScan', 'scanDescription', 'generateNfo', 'thumbnailGeminiEnabled', 'keywords', 'excludeKeywords']) {
     if (!(key in body)) continue;
     const value = body[key];
     if (key === 'name') { if (typeof value !== 'string' || !value.trim() || value.length > 160) throw Object.assign(new Error('Name is required (max 160 chars)'), { status: 400 }); out.name = value.trim(); }
@@ -49,11 +49,13 @@ function sourceInput(body, partial = false) {
     else if (key === 'keywordSearchMode') { if (!['TEXT', 'REGEX'].includes(value)) throw Object.assign(new Error('keywordSearchMode must be TEXT or REGEX'), { status: 400 }); out[key] = value; }
     else if (key === 'enabled') { if (typeof value !== 'boolean') throw Object.assign(new Error('enabled must be boolean'), { status: 400 }); out.enabled = value; }
     else if (key === 'autoApproveVideos') { if (typeof value !== 'boolean') throw Object.assign(new Error('autoApproveVideos must be boolean'), { status: 400 }); out.autoApproveVideos = value; }
+    else if (key === 'adaptiveDiscoveryEnabled') { if (typeof value !== 'boolean') throw Object.assign(new Error('adaptiveDiscoveryEnabled must be boolean'), { status: 400 }); out.adaptiveDiscoveryEnabled = value; }
     else if (key === 'videosPerScan') { if (!Number.isInteger(value) || value < 1 || value > 10000) throw Object.assign(new Error('videosPerScan must be an integer from 1 to 10000'), { status: 400 }); out.videosPerScan = value; }
     else if (key === 'scanDescription' || key === 'generateNfo' || key === 'thumbnailGeminiEnabled' || key === 'visualMatchEnabled' || key === 'visualMatchAutoApprove') { if (typeof value !== 'boolean') throw Object.assign(new Error(`${key} must be boolean`), { status: 400 }); out[key] = value; }
     else out[key] = cleanKeywords(value);
   }
   if (out.type && out.type !== 'channel' && out.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 });
+  if (out.type && out.type !== 'channel' && out.adaptiveDiscoveryEnabled) throw Object.assign(new Error('Adaptive Top 10 discovery is only available for channel sources'), { status: 400 });
   if (out.type && out.type !== 'channel' && out.autoApproveVideos === undefined) out.autoApproveVideos = false;
   if (out.keywordSearchMode === 'REGEX') {
     try { validateRegexList(out.keywords || []); validateRegexList(out.excludeKeywords || []); }
@@ -167,9 +169,10 @@ app.put('/api/sources/:id', async (req, res, next) => {
   try {
     objectId(req.params.id);
     const updates = sourceInput(req.body, true);
-    const current = await Source.findById(req.params.id).select('type visualReferences visualReferenceMimeType visualMatchEnabled visualMatchAction keywordSearchMode keywords excludeKeywords');
+    const current = await Source.findById(req.params.id).select('type adaptiveDiscoveryEnabled visualReferences visualReferenceMimeType visualMatchEnabled visualMatchAction keywordSearchMode keywords excludeKeywords');
     if (!current) return res.status(404).json({ error: 'Source not found' });
     if ((updates.type || current.type) !== 'channel' && updates.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 });
+    if ((updates.type || current.type) !== 'channel' && (updates.adaptiveDiscoveryEnabled ?? current.adaptiveDiscoveryEnabled)) throw Object.assign(new Error('Adaptive Top 10 discovery is only available for channel sources'), { status: 400 });
     if (updates.visualMatchEnabled === true && !current.visualReferences.length && !current.visualReferenceMimeType) throw Object.assign(new Error('Upload a reference image before enabling visual matching'), { status: 400 });
     if ((updates.keywordSearchMode || current.keywordSearchMode) === 'REGEX') {
       try { validateRegexList(updates.keywords || current.keywords || []); validateRegexList(updates.excludeKeywords || current.excludeKeywords || []); }
@@ -177,9 +180,28 @@ app.put('/api/sources/:id', async (req, res, next) => {
     }
     if (updates.visualMatchEnabled === true && !current.visualMatchEnabled) updates.geminiLastScannedVideoId = '';
     if (updates.visualMatchAction && updates.visualMatchAction !== current.visualMatchAction) updates.geminiLastScannedVideoId = '';
+    if (updates.adaptiveDiscoveryEnabled === true && !current.adaptiveDiscoveryEnabled) updates.adaptiveLastRunAt = null;
     const source = await Source.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true, runValidators: true });
     res.json(source);
   } catch (e) { next(e); }
+});
+app.get('/api/adaptive/:sourceId', async (req, res, next) => {
+  try {
+    objectId(req.params.sourceId);
+    const source = await Source.findById(req.params.sourceId).select('name type adaptiveDiscoveryEnabled adaptiveLastRunAt').lean();
+    if (!source) return res.status(404).json({ error: 'Source not found' });
+    if (!source.adaptiveDiscoveryEnabled) return res.status(409).json({ error: 'Adaptive discovery is not enabled for this source' });
+    const [profile, recent, engagement] = await Promise.all([
+      ChannelProfile.findOne({ sourceId: source._id }).lean(),
+      ChannelRanking.findOne({ sourceId: source._id, rankingType: 'recent' }).sort({ rankingDate: -1 }).lean(),
+      ChannelRanking.findOne({ sourceId: source._id, rankingType: 'engagement' }).sort({ rankingDate: -1 }).lean()
+    ]);
+    const ids = [...new Set([...(recent?.entries || []), ...(engagement?.entries || [])].map(item => item.youtubeId))];
+    const queue = await QueuedVideo.find({ youtubeId: { $in: ids } }).select('youtubeId status approvalStatus').lean();
+    const queueState = new Map(queue.map(item => [item.youtubeId, `${item.approvalStatus}/${item.status}`]));
+    const currentQueueState = entries => (entries || []).map(item => ({ ...item, queueStatus: queueState.get(item.youtubeId) || 'NOT_QUEUED' }));
+    res.json({ source, profile, rankings: { recent: currentQueueState(recent?.entries), recentRankingDate: recent?.rankingDate || null, engagement: currentQueueState(engagement?.entries), engagementRankingDate: engagement?.rankingDate || null } });
+  } catch (error) { next(error); }
 });
 app.delete('/api/sources/:id', async (req, res, next) => {
   try {
@@ -281,7 +303,7 @@ async function start() {
   logger.info('server_starting', { port: Number(process.env.PORT || 3000), logLevel: process.env.LOG_LEVEL || 'info' });
   await connectDB();
   logger.info('mongodb_connected');
-  await Promise.all([Source.init(), QueuedVideo.init(), ScanHistory.init(), ScannerSettings.init()]);
+  await Promise.all([Source.init(), QueuedVideo.init(), ScanHistory.init(), ScannerSettings.init(), AdaptiveVideo.init(), ChannelProfile.init(), ChannelRanking.init(), VideoStatsHistory.init()]);
   await scanner.migrateLegacyThumbnailSetting();
   logger.info('mongodb_indexes_ready', { collections: ['sources', 'youtube_queue', 'scan_history', 'scanner_settings'] });
   const approvalHoldback = await QueuedVideo.updateMany({ status: 'PENDING', approvalStatus: { $ne: 'APPROVED' } }, { $set: { status: 'AWAITING_APPROVAL' } });
