@@ -1,6 +1,6 @@
 'use strict';
 const $ = s => document.querySelector(s);
-const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', sourceSearch: '', approvalChannelId: '', timer: null, sorts: {} };
+const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', sourceSearch: '', sourceSearchRegex: false, approvalChannelId: '', timer: null, sorts: {} };
 let visualPreviewUrls = [];
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
 function applyTheme(theme, persist = true) {
@@ -21,6 +21,34 @@ async function api(url, options = {}) {
 }
 function toast(message, error = false) { const el = $('#notice'); el.textContent = message; el.className = `notice${error ? ' error' : ''}`; el.hidden = false; clearTimeout(state.timer); state.timer = setTimeout(() => { el.hidden = true; }, 4500); }
 function badge(value) { return `<span class="badge ${escapeHtml(value)}">${escapeHtml(value)}</span>`; }
+function compileSourceSearchRegex(pattern) {
+  if (pattern.length > 256) throw new Error('Regex search is limited to 256 characters');
+  if (/\\[1-9]|\([^)]*\)[*+{]/.test(pattern)) throw new Error('Backreferences and repeated groups are not supported in source search');
+  const quantifiers = pattern.match(/(?<!\\)[*+]|(?<!\\)\{\d+(?:,\d*)?\}/g) || [];
+  if (quantifiers.length > 8 || quantifiers.filter(q => q === '*' || q === '+').length > 3 || quantifiers.some(q => { const n = q.match(/\d+/); return n && Number(n[0]) > 1000; })) throw new Error('Use at most 8 simple regex quantifiers, including 3 unbounded repetitions (counts up to 1000)');
+  return new RegExp(pattern.normalize('NFC'), 'iu');
+}
+function applySourceSearch() {
+  const query = state.sourceSearch.trim();
+  let matcher = null; let errorMessage = '';
+  if (query && state.sourceSearchRegex) {
+    try { matcher = compileSourceSearchRegex(query); }
+    catch (err) { errorMessage = err.message; }
+  }
+  const error = $('#sourceSearchError');
+  if (error) { error.textContent = errorMessage; error.hidden = !errorMessage; }
+  let visible = 0;
+  $('#content').querySelectorAll('.source-card').forEach(card => {
+    const name = card.dataset.sourceName || '';
+    const url = card.dataset.sourceUrl || '';
+    const haystack = `${name} ${url}`;
+    const matches = !query || (state.sourceSearchRegex ? (matcher ? matcher.test(haystack) : true) : haystack.includes(query.normalize('NFC').toLocaleLowerCase()));
+    card.hidden = !matches;
+    if (!card.hidden) visible++;
+  });
+  const empty = $('#sourceSearchEmpty');
+  if (empty) empty.hidden = visible > 0 || Boolean(errorMessage);
+}
 function renderVisualReferences(saved = [], selectedFiles = []) {
   visualPreviewUrls.forEach(url => URL.revokeObjectURL(url));
   visualPreviewUrls = [];
@@ -70,9 +98,9 @@ async function renderOverview() {
 }
 async function renderSources() {
   const sources = await api('/api/sources');
-  const tabs = `<div class="toolbar"><label class="source-search">Search sources<input id="sourceSearch" type="search" placeholder="Channel or source name" value="${escapeHtml(state.sourceSearch)}"></label>${['channel', 'playlist', 'shorts'].map(t => `<button class="smallbtn ${state.sourceType === t ? 'active' : ''}" data-type="${t}">${t[0].toUpperCase() + t.slice(1)} (${sources.filter(s => s.type === t).length})</button>`).join('')}<button class="button primary" id="addSource">+ Add source</button></div>`;
+  const tabs = `<div class="toolbar"><label class="source-search">Search sources<input id="sourceSearch" type="search" placeholder="Channel/source name or regex" value="${escapeHtml(state.sourceSearch)}"></label><label class="source-regex-toggle"><input id="sourceSearchRegex" type="checkbox" ${state.sourceSearchRegex ? 'checked' : ''}> Regex</label>${['channel', 'playlist', 'shorts'].map(t => `<button class="smallbtn ${state.sourceType === t ? 'active' : ''}" data-type="${t}">${t[0].toUpperCase() + t.slice(1)} (${sources.filter(s => s.type === t).length})</button>`).join('')}<button class="button primary" id="addSource">+ Add source</button></div><p class="sub regex-search-error" id="sourceSearchError" hidden></p>`;
   const shown = sources.filter(s => s.type === state.sourceType);
-  const cards = shown.length ? `<div class="source-grid">${shown.map(s => `<article class="source-card" data-source-name="${escapeHtml(s.name.toLocaleLowerCase())}"><div class="source-title"><div><h3>${escapeHtml(s.name)}</h3><div class="source-url" title="${escapeHtml(s.url)}">${escapeHtml(s.url)}</div></div>${badge(s.enabled ? 'ENABLED' : 'DISABLED')}</div><div class="tagrow">${badge(s.priority)}<span class="tag">${escapeHtml(s.matchMode)} match</span><span class="tag">${s.videosPerScan || 50} videos/scan</span><span class="tag">Description ${s.scanDescription === false && !s.generateNfo ? 'off' : 'on'}</span>${s.generateNfo ? '<span class="tag">NFO enabled</span>' : ''}${s.thumbnailGeminiEnabled ? '<span class="tag">Gemini thumbnail analysis enabled</span>' : ''}${(s.keywords || []).map(k => `<span class="tag">${escapeHtml(k)}</span>`).join('')}${(s.excludeKeywords || []).map(k => `<span class="tag">− ${escapeHtml(k)}</span>`).join('')}</div><div class="cardfoot"><small>Last scan: ${s.lastScannedAt ? new Date(s.lastScannedAt).toLocaleString() : 'Never scanned'}</small><div class="actions"><button class="smallbtn" data-act="scan-source" data-id="${s._id}">Scan</button><button class="smallbtn" data-act="toggle-gemini" data-id="${s._id}">${s.thumbnailGeminiEnabled ? 'Disable Gemini' : 'Enable Gemini'}</button><button class="smallbtn" data-act="edit-source" data-id="${s._id}">Edit</button><button class="smallbtn" data-act="toggle-source" data-id="${s._id}">${s.enabled ? 'Disable' : 'Enable'}</button><button class="smallbtn" data-act="delete-source" data-id="${s._id}">Delete</button></div></div></article>`).join('')}</div><div id="sourceSearchEmpty" class="empty" hidden><strong>No matching sources</strong>Try another source name.</div>` : '<div class="empty"><strong>No sources configured</strong>Add a YouTube channel, playlist, or Shorts source to start discovering videos.</div>';
+  const cards = shown.length ? `<div class="source-grid">${shown.map(s => `<article class="source-card" data-source-name="${escapeHtml(s.name.normalize('NFC').toLocaleLowerCase())}" data-source-url="${escapeHtml(s.url.normalize('NFC').toLocaleLowerCase())}"><div class="source-title"><div><h3>${escapeHtml(s.name)}</h3><div class="source-url" title="${escapeHtml(s.url)}">${escapeHtml(s.url)}</div></div>${badge(s.enabled ? 'ENABLED' : 'DISABLED')}</div><div class="tagrow">${badge(s.priority)}<span class="tag">${escapeHtml(s.matchMode)} match</span><span class="tag">${s.videosPerScan || 50} videos/scan</span><span class="tag">Description ${s.scanDescription === false && !s.generateNfo ? 'off' : 'on'}</span>${s.generateNfo ? '<span class="tag">NFO enabled</span>' : ''}${s.thumbnailGeminiEnabled ? '<span class="tag">Gemini thumbnail analysis enabled</span>' : ''}${(s.keywords || []).map(k => `<span class="tag">${escapeHtml(k)}</span>`).join('')}${(s.excludeKeywords || []).map(k => `<span class="tag">− ${escapeHtml(k)}</span>`).join('')}</div><div class="cardfoot"><small>Last scan: ${s.lastScannedAt ? new Date(s.lastScannedAt).toLocaleString() : 'Never scanned'}</small><div class="actions"><button class="smallbtn" data-act="scan-source" data-id="${s._id}">Scan</button><button class="smallbtn" data-act="toggle-gemini" data-id="${s._id}">${s.thumbnailGeminiEnabled ? 'Disable Gemini' : 'Enable Gemini'}</button><button class="smallbtn" data-act="edit-source" data-id="${s._id}">Edit</button><button class="smallbtn" data-act="toggle-source" data-id="${s._id}">${s.enabled ? 'Disable' : 'Enable'}</button><button class="smallbtn" data-act="delete-source" data-id="${s._id}">Delete</button></div></div></article>`).join('')}</div><div id="sourceSearchEmpty" class="empty" hidden><strong>No matching sources</strong>Try another source name.</div>` : '<div class="empty"><strong>No sources configured</strong>Add a YouTube channel, playlist, or Shorts source to start discovering videos.</div>';
   $('#content').innerHTML = `${shell('Manage sources', 'Configure YouTube sources and their discovery rules', tabs)}${cards}</div>`;
 }
 const views = {
@@ -123,6 +151,7 @@ function showSource(source = null) {
   form.elements.videosPerScan.value = source?.videosPerScan || 50;
   form.elements.generateNfo.checked = source?.generateNfo ?? false;
   form.elements.thumbnailGeminiEnabled.checked = source?.thumbnailGeminiEnabled ?? false;
+  form.elements.keywordSearchMode.value = source?.keywordSearchMode ?? 'TEXT';
   form.elements.visualMatchEnabled.checked = source?.visualMatchEnabled ?? false;
   form.elements.visualMatchAutoApprove.checked = source?.visualMatchAutoApprove ?? true;
   form.elements.visualMatchAction.value = source?.visualMatchAction ?? 'ACCEPT';
@@ -140,10 +169,21 @@ function showSource(source = null) {
   form.elements.scanDescription.checked = source?.scanDescription !== false || form.elements.generateNfo.checked;
   for (const key of ['name', 'url', 'type', 'priority', 'matchMode']) if (source && source[key] !== undefined) form.elements[key].value = source[key];
   $('#autoApproveField').hidden = form.elements.type.value !== 'channel';
-  form.elements.keywords.value = (source?.keywords || []).join(', '); form.elements.excludeKeywords.value = (source?.excludeKeywords || []).join(', '); $('#sourceDialog').showModal();
+  form.dataset.keywordSearchMode = form.elements.keywordSearchMode.value;
+  form.elements.keywords.value = formatKeywordEntries(source?.keywords || [], form.elements.keywordSearchMode.value);
+  form.elements.excludeKeywords.value = formatKeywordEntries(source?.excludeKeywords || [], form.elements.keywordSearchMode.value);
+  updateKeywordSearchHelp(form.elements.keywordSearchMode.value);
+  $('#sourceDialog').showModal();
 }
 $('#sourceForm').elements.visualMatchEnabled.addEventListener('change', e => { $('#visualAutoApproveField').hidden = !e.target.checked || e.currentTarget.form.elements.visualMatchAction.value === 'REJECT'; $('#visualMatchActionField').hidden = !e.target.checked; });
 $('#sourceForm').elements.visualMatchAction.addEventListener('change', e => { $('#visualAutoApproveField').hidden = !e.currentTarget.form.elements.visualMatchEnabled.checked || e.target.value === 'REJECT'; });
+$('#sourceForm').elements.keywordSearchMode.addEventListener('change', e => {
+  const form = e.currentTarget.form; const oldMode = form.dataset.keywordSearchMode || 'TEXT'; const newMode = e.target.value;
+  form.elements.keywords.value = formatKeywordEntries(parseKeywordEntries(form.elements.keywords.value, oldMode), newMode);
+  form.elements.excludeKeywords.value = formatKeywordEntries(parseKeywordEntries(form.elements.excludeKeywords.value, oldMode), newMode);
+  form.dataset.keywordSearchMode = newMode;
+  updateKeywordSearchHelp(newMode);
+});
 $('#sourceForm').elements.visualReferenceFile.addEventListener('change', e => {
   const files = [...e.target.files];
   if (files.length) { e.currentTarget.form.elements.visualMatchEnabled.checked = true; $('#visualAutoApproveField').hidden = e.currentTarget.form.elements.visualMatchAction.value === 'REJECT'; $('#visualMatchActionField').hidden = false; }
@@ -176,12 +216,37 @@ $('#removeVisualReference').addEventListener('click', async () => {
 });
 $('#sourceForm').elements.type.addEventListener('change', e => { $('#autoApproveField').hidden = e.target.value !== 'channel'; });
 function splitWords(s) { return s.split(',').map(x => x.trim()).filter(Boolean); }
-async function fillKeywords(source) {
-  const box = $('#keywordEditor'); box.className = ''; box.innerHTML = `<div class="formgrid"><label>Include keywords<small> (comma separated)</small><textarea id="kwIncludes" rows="4">${escapeHtml((source.keywords || []).join(', '))}</textarea></label><label>Exclude keywords<small> (always take priority)</small><textarea id="kwExcludes" rows="4">${escapeHtml((source.excludeKeywords || []).join(', '))}</textarea></label><label>Match mode<select id="kwMode"><option ${source.matchMode === 'ANY' ? 'selected' : ''}>ANY</option><option ${source.matchMode === 'ALL' ? 'selected' : ''}>ALL</option></select></label><div class="actions"><button class="button" id="clearKeywords">Delete all keywords</button><button class="button primary" id="saveKeywords">Save keyword rules</button></div></div>`;
-  $('#saveKeywords').onclick = async () => { await api(`/api/sources/${source._id}`, { method: 'PUT', body: JSON.stringify({ keywords: splitWords($('#kwIncludes').value), excludeKeywords: splitWords($('#kwExcludes').value), matchMode: $('#kwMode').value }) }); toast('Keyword rules saved'); await render(); };
-  $('#clearKeywords').onclick = async () => { await api(`/api/sources/${source._id}`, { method: 'PUT', body: JSON.stringify({ keywords: [], excludeKeywords: [] }) }); toast('All keywords cleared'); await render(); };
+function parseKeywordEntries(value, mode = 'TEXT') {
+  return mode === 'REGEX' ? value.split(/\r?\n/).map(part => part.trim()).filter(Boolean) : splitWords(value);
 }
-$('#nav').addEventListener('click', e => { const b = e.target.closest('[data-view]'); if (!b) return; state.view = b.dataset.view; state.page = 1; render().catch(err => toast(err.message, true)); });
+function formatKeywordEntries(entries, mode = 'TEXT') { return entries.join(mode === 'REGEX' ? '\n' : ', '); }
+function updateKeywordSearchHelp(mode, element = $('#keywordSearchHelp')) {
+  if (element) element.textContent = mode === 'REGEX'
+    ? 'Enter one case-insensitive Unicode regex per line. Malayalam text is supported; repeated groups and backreferences are disabled for scan safety.'
+    : 'Comma-separated text keywords. Malayalam and other Unicode scripts are supported.';
+}
+async function fillKeywords(source) {
+  let activeMode = source.keywordSearchMode || 'TEXT';
+  const box = $('#keywordEditor'); box.className = '';
+  box.innerHTML = `<div class="formgrid"><label>Include keywords<small> (one regex per line in regex mode)</small><textarea id="kwIncludes" rows="4">${escapeHtml(formatKeywordEntries(source.keywords || [], activeMode))}</textarea></label><label>Exclude keywords<small> (always take priority)</small><textarea id="kwExcludes" rows="4">${escapeHtml(formatKeywordEntries(source.excludeKeywords || [], activeMode))}</textarea></label><label>Keyword search<select id="kwSearchMode"><option value="TEXT" ${activeMode === 'TEXT' ? 'selected' : ''}>Text keywords</option><option value="REGEX" ${activeMode === 'REGEX' ? 'selected' : ''}>Regular expressions</option></select></label><p class="sub wide" id="kwSearchHelp"></p><label>Match mode<select id="kwMode"><option ${source.matchMode === 'ANY' ? 'selected' : ''}>ANY</option><option ${source.matchMode === 'ALL' ? 'selected' : ''}>ALL</option></select></label><div class="actions"><button class="button" id="clearKeywords">Delete all keywords</button><button class="button primary" id="saveKeywords">Save keyword rules</button></div></div>`;
+  updateKeywordSearchHelp(activeMode, $('#kwSearchHelp'));
+  $('#kwSearchMode').addEventListener('change', e => {
+    const newMode = e.target.value;
+    $('#kwIncludes').value = formatKeywordEntries(parseKeywordEntries($('#kwIncludes').value, activeMode), newMode);
+    $('#kwExcludes').value = formatKeywordEntries(parseKeywordEntries($('#kwExcludes').value, activeMode), newMode);
+    activeMode = newMode;
+    updateKeywordSearchHelp(newMode, $('#kwSearchHelp'));
+  });
+  $('#saveKeywords').onclick = async () => {
+    const selectedMode = $('#kwSearchMode').value;
+    await api(`/api/sources/${source._id}`, { method: 'PUT', body: JSON.stringify({ keywords: parseKeywordEntries($('#kwIncludes').value, selectedMode), excludeKeywords: parseKeywordEntries($('#kwExcludes').value, selectedMode), matchMode: $('#kwMode').value, keywordSearchMode: selectedMode }) });
+    toast('Keyword rules saved'); await render();
+  };
+  $('#clearKeywords').onclick = async () => {
+    await api(`/api/sources/${source._id}`, { method: 'PUT', body: JSON.stringify({ keywords: [], excludeKeywords: [] }) });
+    toast('All keywords cleared'); await render();
+  };
+}$('#nav').addEventListener('click', e => { const b = e.target.closest('[data-view]'); if (!b) return; state.view = b.dataset.view; state.page = 1; render().catch(err => toast(err.message, true)); });
 $('#themeToggle').addEventListener('click', () => applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'));
 applyTheme(document.documentElement.dataset.theme || 'dark', false);
 $('#content').addEventListener('click', async e => {
@@ -207,14 +272,12 @@ $('#content').addEventListener('click', async e => {
 $('#content').addEventListener('input', e => {
   if (e.target.id !== 'sourceSearch') return;
   state.sourceSearch = e.target.value;
-  const query = state.sourceSearch.trim().toLocaleLowerCase();
-  let visible = 0;
-  $('#content').querySelectorAll('.source-card').forEach(card => {
-    card.hidden = !card.dataset.sourceName.includes(query);
-    if (!card.hidden) visible++;
-  });
-  const empty = $('#sourceSearchEmpty');
-  if (empty) empty.hidden = visible > 0;
+  applySourceSearch();
+});
+$('#content').addEventListener('change', e => {
+  if (e.target.id !== 'sourceSearchRegex') return;
+  state.sourceSearchRegex = e.target.checked;
+  applySourceSearch();
 });
 $('#content').addEventListener('change', e => { if (!e.target.matches('[data-sort]')) return; state.sorts[state.view] = e.target.value; state.page = 1; render().catch(err => toast(err.message, true)); });
 $('#content').addEventListener('change', e => { if (e.target.id !== 'approvalChannelFilter') return; state.approvalChannelId = e.target.value; state.page = 1; render().catch(err => toast(err.message, true)); });
@@ -239,8 +302,10 @@ $('#sourceForm').addEventListener('submit', async e => {
     generateNfo: f.elements.generateNfo.checked, thumbnailGeminiEnabled: f.elements.thumbnailGeminiEnabled.checked,
     visualMatchEnabled: wantsVisualMatch && !images.length, visualMatchAutoApprove: f.elements.visualMatchAutoApprove.checked,
     visualMatchAction: f.elements.visualMatchAction.value,
+    keywordSearchMode: f.elements.keywordSearchMode.value,
     autoApproveVideos: f.elements.type.value === 'channel' && f.elements.autoApproveVideos.checked,
-    keywords: splitWords(f.elements.keywords.value), excludeKeywords: splitWords(f.elements.excludeKeywords.value)
+    keywords: parseKeywordEntries(f.elements.keywords.value, f.elements.keywordSearchMode.value),
+    excludeKeywords: parseKeywordEntries(f.elements.excludeKeywords.value, f.elements.keywordSearchMode.value)
   };
   try {
     const saved = await api(id ? `/api/sources/${id}` : '/api/sources', { method: id ? 'PUT' : 'POST', body: JSON.stringify(body) });

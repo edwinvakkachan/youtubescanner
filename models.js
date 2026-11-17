@@ -21,6 +21,7 @@ const sourceSchema = new Schema({
   visualMatchAutoApprove: { type: Boolean, default: true },
   visualMatchAction: { type: String, enum: ['ACCEPT', 'REJECT'], default: 'ACCEPT' },
   visualReferences: { type: [visualReferenceSchema], default: [] },
+  keywordSearchMode: { type: String, enum: ['TEXT', 'REGEX'], default: 'TEXT' },
   visualReferenceMimeType: { type: String, default: '' },
   visualReferenceFileId: { type: String, default: '' },
   visualReferenceUrl: { type: String, default: '' },

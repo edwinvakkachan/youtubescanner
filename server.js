@@ -8,6 +8,7 @@ const scanner = require('./scanner');
 const scheduler = require('./scheduler');
 const logger = require('./logger');
 const imagekit = require('./imagekit');
+const { validateRegexList } = require('./keyword-search');
 const app = express();
 app.use((req, res, next) => {
   const started = Date.now();
@@ -30,13 +31,13 @@ const maxVisualReferenceBytes = 8 * 1024 * 1024;
 const allowedUrl = value => { try { const u = new URL(value); return ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be', 'youtube.com.', 'www.youtube.com.'].includes(u.hostname) || u.hostname.endsWith('.youtube.com'); } catch { return false; } };
 function cleanKeywords(value) {
   if (value === undefined) return undefined;
-  if (!Array.isArray(value) || value.length > 200 || value.some(v => typeof v !== 'string' || !v.trim() || v.length > 120)) throw Object.assign(new Error('Keywords must be an array of non-empty strings (max 120 chars each)'), { status: 400 });
+  if (!Array.isArray(value) || value.length > 200 || value.some(v => typeof v !== 'string' || !v.trim() || v.length > 256)) throw Object.assign(new Error('Keywords must be an array of non-empty strings (max 256 chars each)'), { status: 400 });
   return [...new Set(value.map(v => v.trim()))];
 }
 function sourceInput(body, partial = false) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw Object.assign(new Error('JSON object required'), { status: 400 });
   const out = {};
-  for (const key of ['name', 'url', 'type', 'matchMode', 'priority', 'enabled', 'autoApproveVideos', 'visualMatchEnabled', 'visualMatchAutoApprove', 'visualMatchAction', 'videosPerScan', 'scanDescription', 'generateNfo', 'thumbnailGeminiEnabled', 'keywords', 'excludeKeywords']) {
+  for (const key of ['name', 'url', 'type', 'matchMode', 'priority', 'enabled', 'autoApproveVideos', 'visualMatchEnabled', 'visualMatchAutoApprove', 'visualMatchAction', 'keywordSearchMode', 'videosPerScan', 'scanDescription', 'generateNfo', 'thumbnailGeminiEnabled', 'keywords', 'excludeKeywords']) {
     if (!(key in body)) continue;
     const value = body[key];
     if (key === 'name') { if (typeof value !== 'string' || !value.trim() || value.length > 160) throw Object.assign(new Error('Name is required (max 160 chars)'), { status: 400 }); out.name = value.trim(); }
@@ -45,6 +46,7 @@ function sourceInput(body, partial = false) {
     else if (key === 'matchMode') { if (!matchModes.includes(value)) throw Object.assign(new Error('matchMode must be ANY or ALL'), { status: 400 }); out.matchMode = value; }
     else if (key === 'priority') { if (!priorities.includes(value)) throw Object.assign(new Error('Invalid priority'), { status: 400 }); out.priority = value; }
     else if (key === 'visualMatchAction') { if (!['ACCEPT', 'REJECT'].includes(value)) throw Object.assign(new Error('visualMatchAction must be ACCEPT or REJECT'), { status: 400 }); out[key] = value; }
+    else if (key === 'keywordSearchMode') { if (!['TEXT', 'REGEX'].includes(value)) throw Object.assign(new Error('keywordSearchMode must be TEXT or REGEX'), { status: 400 }); out[key] = value; }
     else if (key === 'enabled') { if (typeof value !== 'boolean') throw Object.assign(new Error('enabled must be boolean'), { status: 400 }); out.enabled = value; }
     else if (key === 'autoApproveVideos') { if (typeof value !== 'boolean') throw Object.assign(new Error('autoApproveVideos must be boolean'), { status: 400 }); out.autoApproveVideos = value; }
     else if (key === 'videosPerScan') { if (!Number.isInteger(value) || value < 1 || value > 10000) throw Object.assign(new Error('videosPerScan must be an integer from 1 to 10000'), { status: 400 }); out.videosPerScan = value; }
@@ -53,6 +55,10 @@ function sourceInput(body, partial = false) {
   }
   if (out.type && out.type !== 'channel' && out.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 });
   if (out.type && out.type !== 'channel' && out.autoApproveVideos === undefined) out.autoApproveVideos = false;
+  if (out.keywordSearchMode === 'REGEX') {
+    try { validateRegexList(out.keywords || []); validateRegexList(out.excludeKeywords || []); }
+    catch (err) { throw Object.assign(err, { status: 400 }); }
+  }
   if (!partial && (!out.name || !out.url || !out.type)) throw Object.assign(new Error('name, url and type are required'), { status: 400 });
   return out;
 }
@@ -161,10 +167,14 @@ app.put('/api/sources/:id', async (req, res, next) => {
   try {
     objectId(req.params.id);
     const updates = sourceInput(req.body, true);
-    const current = await Source.findById(req.params.id).select('type visualReferences visualReferenceMimeType visualMatchEnabled visualMatchAction');
+    const current = await Source.findById(req.params.id).select('type visualReferences visualReferenceMimeType visualMatchEnabled visualMatchAction keywordSearchMode keywords excludeKeywords');
     if (!current) return res.status(404).json({ error: 'Source not found' });
     if ((updates.type || current.type) !== 'channel' && updates.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 });
     if (updates.visualMatchEnabled === true && !current.visualReferences.length && !current.visualReferenceMimeType) throw Object.assign(new Error('Upload a reference image before enabling visual matching'), { status: 400 });
+    if ((updates.keywordSearchMode || current.keywordSearchMode) === 'REGEX') {
+      try { validateRegexList(updates.keywords || current.keywords || []); validateRegexList(updates.excludeKeywords || current.excludeKeywords || []); }
+      catch (err) { throw Object.assign(err, { status: 400 }); }
+    }
     if (updates.visualMatchEnabled === true && !current.visualMatchEnabled) updates.geminiLastScannedVideoId = '';
     if (updates.visualMatchAction && updates.visualMatchAction !== current.visualMatchAction) updates.geminiLastScannedVideoId = '';
     const source = await Source.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true, runValidators: true });

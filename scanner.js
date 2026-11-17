@@ -9,10 +9,12 @@ const { connectDB } = require('./db');
 const { Source, QueuedVideo, ScanHistory } = require('./models');
 const logger = require('./logger');
 const imagekit = require('./imagekit');
+const { compileSafeRegex } = require('./keyword-search');
 
 const LIMIT = Math.min(10000, Math.max(1, Number.parseInt(process.env.VIDEOS_PER_SOURCE || '50', 10) || 50));
 const MAX_RETRIES = Math.max(1, Number.parseInt(process.env.MAX_RETRIES || '3', 10) || 3);
 const PRIORITY_RANK = { HIGH: 1, NORMAL: 2, LOW: 3 };
+const keywordRegexCache = new WeakMap();
 let activeAll = false;
 const activeSources = new Set();
 
@@ -57,12 +59,30 @@ function videoId(entry) { return entry.id || (entry.url && /^[\w-]{11}$/.test(en
 function videoUrl(entry, id) { return entry.webpage_url || entry.url && /^https?:/.test(entry.url) && entry.url || `https://www.youtube.com/watch?v=${id}`; }
 function findMatches(source, entry, description = entry.description || '', thumbnailText = '') {
   const includedDescription = source.scanDescription === false && source.generateNfo !== true ? '' : description;
-  const text = `${entry.title || ''}\n${includedDescription}\n${thumbnailText}`.toLocaleLowerCase();
-  const excludes = source.excludeKeywords || [];
-  if (excludes.some(k => k && text.includes(k.toLocaleLowerCase()))) return { accepted: false, matches: [], excluded: true };
+  // NFC normalization keeps canonically equivalent Malayalam and other Unicode
+  // text searchable even when YouTube metadata and user input encode marks differently.
+  const originalText = `${entry.title || ''}\n${includedDescription}\n${thumbnailText}`.normalize('NFC');
+  const text = originalText.toLocaleLowerCase();
+  const regexMode = source.keywordSearchMode === 'REGEX';
+  let regexRules;
+  if (regexMode) {
+    regexRules = keywordRegexCache.get(source);
+    if (!regexRules) {
+      regexRules = {
+        includes: (source.keywords || []).filter(Boolean).map(pattern => compileSafeRegex(pattern)),
+        excludes: (source.excludeKeywords || []).filter(Boolean).map(pattern => compileSafeRegex(pattern))
+      };
+      keywordRegexCache.set(source, regexRules);
+    }
+  }
+  const matchesPattern = (pattern, rule) => regexMode
+    ? rule.test(originalText.slice(0, 8000))
+    : text.includes(pattern.normalize('NFC').toLocaleLowerCase());
+  const excludes = (source.excludeKeywords || []).filter(Boolean);
+  if (excludes.some((k, index) => matchesPattern(k, regexRules?.excludes[index]))) return { accepted: false, matches: [], excluded: true };
   const includes = (source.keywords || []).filter(Boolean);
   if (!includes.length) return { accepted: true, matches: [], excluded: false };
-  const matches = includes.filter(k => text.includes(k.toLocaleLowerCase()));
+  const matches = includes.filter((k, index) => matchesPattern(k, regexRules?.includes[index]));
   return { accepted: source.matchMode === 'ALL' ? matches.length === includes.length : matches.length > 0, matches, excluded: false };
 }
 async function thumbnailTextFromUrl(url, visualReferences = []) {
