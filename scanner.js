@@ -10,7 +10,7 @@ const { Source, QueuedVideo, ScanHistory, AdaptiveVideo, ChannelProfile, Channel
 const logger = require('./logger');
 const imagekit = require('./imagekit');
 const { compileSafeRegex } = require('./keyword-search');
-const { computeProfile, rankVideos } = require('./adaptive-analytics');
+const { computeProfile, rankVideos, median } = require('./adaptive-analytics');
 
 const LIMIT = Math.min(10000, Math.max(1, Number.parseInt(process.env.VIDEOS_PER_SOURCE || '50', 10) || 50));
 const MAX_RETRIES = Math.max(1, Number.parseInt(process.env.MAX_RETRIES || '3', 10) || 3);
@@ -73,8 +73,9 @@ function runAdaptiveFeed(source, url, contentType, target, cutoffDate) {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     const executable = process.env.YT_DLP_PATH || 'yt-dlp';
-    const cutoff = cutoffDate.toISOString().slice(0, 10).replace(/-/g, '');
-    const args = ['--dump-json', '--lazy-playlist', '--dateafter', cutoff, '--ignore-errors', '--no-warnings', '--skip-download', url];
+    const args = ['--dump-json', '--lazy-playlist'];
+    if (cutoffDate) args.push('--dateafter', cutoffDate.toISOString().slice(0, 10).replace(/-/g, ''));
+    args.push('--ignore-errors', '--no-warnings', '--skip-download', url);
     const child = spawn(executable, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     const entries = []; let stderr = ''; let settled = false; let stopReason = '';
     const timeout = setTimeout(() => { child.kill(); if (!settled) { settled = true; reject(new Error('Adaptive yt-dlp discovery timed out after 5 minutes')); } }, 300000);
@@ -83,7 +84,7 @@ function runAdaptiveFeed(source, url, contentType, target, cutoffDate) {
       if (!line.trim() || stopReason) return;
       try {
         const entry = JSON.parse(line); const publishedAt = entryPublishedAt(entry);
-        if (publishedAt && publishedAt < cutoffDate) { stopReason = 'lookback-boundary'; child.kill(); return; }
+        if (cutoffDate && publishedAt && publishedAt < cutoffDate) { stopReason = 'lookback-boundary'; child.kill(); return; }
         if (publishedAt && publishedAt <= new Date() && videoId(entry)) {
           entry._adaptivePublishedAt = publishedAt;
           entry._adaptiveContentType = contentType;
@@ -105,8 +106,8 @@ function runAdaptiveFeed(source, url, contentType, target, cutoffDate) {
     });
   });
 }
-async function runAdaptiveDiscovery(source) {
-  const target = 30; const lookbackDays = 90; const cutoffDate = new Date(Date.now() - lookbackDays * 86400000);
+async function runAdaptiveDiscovery(source, { target = 30, lookbackDays = 90 } = {}) {
+  const cutoffDate = lookbackDays == null ? null : new Date(Date.now() - lookbackDays * 86400000);
   const allFeeds = getAdaptiveFeedUrls(source.url).map((url, index) => ({ url, contentType: index === 0 ? 'video' : 'short' }));
   const contentType = ['BOTH', 'VIDEOS', 'SHORTS'].includes(source.adaptiveContentType) ? source.adaptiveContentType : 'BOTH';
   const feeds = contentType === 'VIDEOS' ? allFeeds.filter(feed => feed.contentType === 'video') : contentType === 'SHORTS' ? allFeeds.filter(feed => feed.contentType === 'short') : allFeeds;
@@ -355,7 +356,7 @@ async function upsertVideo(source, entry, matches) {
   }
 }
 function optionalNumber(value) { return Number.isFinite(value) ? value : null; }
-async function processAdaptiveChannel(source, entries) {
+async function processAdaptiveChannel(source, entries, { trending = false } = {}) {
   const sourceId = source._id; const now = new Date(); const rankingDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   const oldSnapshots = await VideoStatsHistory.find({ sourceId, youtubeId: { $in: entries.map(videoId).filter(Boolean) }, capturedAt: { $gte: new Date(now.getTime() - 45 * 86400000), $lt: rankingDate } }).sort({ capturedAt: -1 }).lean();
   const previousStats = new Map();
@@ -367,13 +368,20 @@ async function processAdaptiveChannel(source, entries) {
     const views = optionalNumber(entry.view_count); const likes = optionalNumber(entry.like_count); const comments = optionalNumber(entry.comment_count);
     const engagementRate = views > 0 && likes !== null && comments !== null ? ((likes + comments) / views) * 100 : null;
     const previous = previousStats.get(id);
+    const elapsedDays = previous ? Math.max(1 / 24, (seenAt - new Date(previous.updatedAt || previous.capturedAt).getTime()) / 86400000) : null;
     const growthPerDay = views !== null && previous && Number.isFinite(previous.views)
-      ? (views - previous.views) / Math.max(1, (rankingDate - previous.capturedAt) / 86400000) : null;
+      ? (views - previous.views) / elapsedDays : null;
+    const likeGrowthPerDay = likes !== null && previous && Number.isFinite(previous.likes)
+      ? (likes - previous.likes) / elapsedDays : null;
+    const ageDays = Math.max(1, (now - publishedAt) / 86400000);
+    const velocityPerDay = growthPerDay ?? (views === null ? null : views / ageDays);
     const adaptiveVideo = {
       sourceId, youtubeId: id, channelId: entry.channel_id || '', channelName: entry.channel || source.name, title: entry.title || '',
       description: entry.description || '', thumbnail: entry.thumbnail || (Array.isArray(entry.thumbnails) && entry.thumbnails.at(-1)?.url) || '',
       videoUrl: videoUrl(entry, id), publishedAt, duration: optionalNumber(entry.duration), contentType: entry._adaptiveContentType || 'video',
-      views, likes, comments, engagementRate, engagementIncomplete: engagementRate === null, statsUpdatedAt: seenAt, lastDailyViewGrowth: growthPerDay
+      views, likes, comments, engagementRate, engagementIncomplete: engagementRate === null, statsUpdatedAt: seenAt,
+      lastDailyViewGrowth: growthPerDay, lastDailyLikeGrowth: likeGrowthPerDay, viewVelocityPerDay: velocityPerDay,
+      viewSurge: false, surgeThresholdPerDay: null
     };
     await AdaptiveVideo.updateOne({ sourceId, youtubeId: id }, { $set: adaptiveVideo }, { upsert: true });
     await VideoStatsHistory.updateOne({ sourceId, youtubeId: id, capturedAt: rankingDate }, {
@@ -381,7 +389,14 @@ async function processAdaptiveChannel(source, entries) {
       $set: { views, likes, comments, engagementRate }
     }, { upsert: true });
   }
-  const videos = await AdaptiveVideo.find({ sourceId, publishedAt: { $gte: new Date(now.getTime() - 90 * 86400000), $lte: now } }).sort({ publishedAt: -1 }).limit(30).lean();
+  const videos = await AdaptiveVideo.find({ sourceId, publishedAt: { $lte: now } }).sort({ publishedAt: -1 }).limit(trending ? 90 : 30).lean();
+  if (trending) {
+    const activeIds = videos.map(video => video.youtubeId);
+    await Promise.all([
+      AdaptiveVideo.deleteMany({ sourceId, youtubeId: { $nin: activeIds } }),
+      VideoStatsHistory.deleteMany({ sourceId, youtubeId: { $nin: activeIds } })
+    ]);
+  }
   if (!videos.length) {
     const emptyProfile = computeProfile([], now);
     await Promise.all([
@@ -395,15 +410,42 @@ async function processAdaptiveChannel(source, entries) {
     return { inspected: 0, matched: 0, queued: 0 };
   }
   const profileValues = computeProfile(videos, now);
+  const publishedTimes = videos.map(video => new Date(video.publishedAt).getTime()).filter(Number.isFinite);
+  const oldestPublishedAt = publishedTimes.length ? Math.min(...publishedTimes) : NaN;
+  const observedSpanDays = Number.isFinite(oldestPublishedAt) ? Math.max(1, Math.min(30, (now.getTime() - oldestPublishedAt) / 86400000)) : 0;
+  const uploadRateReliable = videos.length >= 15 && observedSpanDays >= 14;
+  const observedUploadCount = videos.filter(video => new Date(video.publishedAt).getTime() >= now.getTime() - observedSpanDays * 86400000).length;
+  const observedUploadsPerDay = observedSpanDays ? observedUploadCount / observedSpanDays : 0;
+  profileValues.uploadRateReliable = uploadRateReliable;
+  profileValues.projectedUploadsNext15Days = Math.max(1, Math.min(90, uploadRateReliable ? Math.ceil(observedUploadsPerDay * 15) : Math.min(90, entries.length || 1)));
   const dailyGrowth = videos.map(video => video.lastDailyViewGrowth).filter(Number.isFinite);
   profileValues.averageDailyViewGrowth = dailyGrowth.length ? dailyGrowth.reduce((sum, value) => sum + value, 0) / dailyGrowth.length : null;
   const profile = await ChannelProfile.findOneAndUpdate({ sourceId }, {
     $set: { ...profileValues, sourceId, channelId: videos.find(video => video.channelId)?.channelId || '', channelName: videos.find(video => video.channelName)?.channelName || source.name }
   }, { upsert: true, new: true }).lean();
   const ranked = rankVideos(videos, profile);
+  const velocities = videos.map(video => video.viewVelocityPerDay).filter(Number.isFinite).filter(value => value >= 0);
+  const velocityMedian = median(velocities) ?? 0;
+  const velocityMad = median(velocities.map(value => Math.abs(value - velocityMedian))) ?? 0;
+  const surgeThreshold = velocityMedian + Math.max(velocityMad * 1.5, velocityMedian * 0.5);
+  const surges = trending ? videos.filter(video => Number.isFinite(video.viewVelocityPerDay) && video.viewVelocityPerDay > surgeThreshold)
+    .sort((a, b) => b.viewVelocityPerDay - a.viewVelocityPerDay) : [];
+  await Promise.all(videos.map(video => AdaptiveVideo.updateOne({ _id: video._id }, { $set: {
+    viewSurge: surges.some(item => item.youtubeId === video.youtubeId),
+    viewSurgeDetectedAt: surges.some(item => item.youtubeId === video.youtubeId) ? seenAt : null,
+    surgeThresholdPerDay: surgeThreshold
+  } })));
   const entriesById = new Map(entries.map(entry => [videoId(entry), entry])); const queueSelection = new Map();
-  for (const item of ranked.recent) queueSelection.set(item.youtubeId, [`adaptive-recent-top-10-rank-${item.rank}`]);
-  for (const item of ranked.engagement) queueSelection.set(item.youtubeId, [...(queueSelection.get(item.youtubeId) || []), `adaptive-engagement-top-10-rank-${item.rank}`]);
+  let detectedForQueue = ranked.recent.length + ranked.engagement.length;
+  if (trending) {
+    const dailyCapacity = profile.projectedUploadsNext15Days || 0;
+    const queueableSurges = surges.slice(0, dailyCapacity);
+    for (const item of queueableSurges) queueSelection.set(item.youtubeId, ['trending-view-surge']);
+    detectedForQueue = surges.length;
+  } else {
+    for (const item of ranked.recent) queueSelection.set(item.youtubeId, [`adaptive-recent-top-10-rank-${item.rank}`]);
+    for (const item of ranked.engagement) queueSelection.set(item.youtubeId, [...(queueSelection.get(item.youtubeId) || []), `adaptive-engagement-top-10-rank-${item.rank}`]);
+  }
   let newQueueEntries = 0;
   for (const [id, labels] of queueSelection) {
     const entry = entriesById.get(id);
@@ -421,9 +463,11 @@ async function processAdaptiveChannel(source, entries) {
   logger.info('adaptive_channel_scan_completed', {
     sourceId: String(sourceId), sourceName: source.name, discoveryWindowDays: 90, candidateCount: videos.length, newlyDiscovered: entries.length,
     statisticsUpdated: videos.length, minimumViewsThreshold: profile.minimumViewsThreshold, thresholdSampleSize: profile.thresholdSampleSize,
-    thresholdProvisional: profile.thresholdProvisional, recentTop10: ranked.recent.length, engagementTop10: ranked.engagement.length, newQueueEntries
+    thresholdProvisional: profile.thresholdProvisional, recentTop10: ranked.recent.length, engagementTop10: ranked.engagement.length,
+    trending, viewSurges: surges.length, surgeThresholdPerDay: surgeThreshold,
+    projectedUploadsNext15Days: profile.projectedUploadsNext15Days, uploadRateReliable: profile.uploadRateReliable, newQueueEntries
   });
-  return { inspected: videos.length, matched: ranked.recent.length + ranked.engagement.length, queued: newQueueEntries };
+  return { inspected: videos.length, matched: detectedForQueue, queued: newQueueEntries, viewSurges: surges.length, projectedUploadsNext15Days: profile.projectedUploadsNext15Days };
 }
 async function scanSource(source, { forceAdaptive = false } = {}) {
   const sourceKey = String(source._id);
@@ -444,24 +488,26 @@ async function scanSource(source, { forceAdaptive = false } = {}) {
     Source.updateOne({ _id: source._id, scanLockToken: lockToken }, { $set: { scanLockUntil: new Date(Date.now() + 6 * 60 * 1000) } })
       .catch(err => logger.warn('source_scan_lock_heartbeat_failed', { sourceId: sourceKey, sourceName: source.name, message: err.message }));
   }, 60_000);
-  logger.info('source_scan_started', { sourceId: sourceKey, sourceName: source.name, sourceType: source.type, maxEntries: limit, scanDescription: source.scanDescription !== false, generateNfo: source.generateNfo === true, thumbnailGeminiEnabled: source.thumbnailGeminiEnabled === true, visualMatchEnabled: source.visualMatchEnabled === true });
+  logger.info('source_scan_started', { sourceId: sourceKey, sourceName: source.name, sourceType: source.type, maxEntries: source.trendingDiscoveryEnabled === true ? 90 : limit, scanDescription: source.scanDescription !== false, generateNfo: source.generateNfo === true, thumbnailGeminiEnabled: source.thumbnailGeminiEnabled === true, visualMatchEnabled: source.visualMatchEnabled === true });
   try {
-    if (source.adaptiveDiscoveryEnabled === true) {
-      if (source.type !== 'channel') throw new Error('Adaptive Top 10 discovery is available for channel sources only');
+    if (source.adaptiveDiscoveryEnabled === true || source.trendingDiscoveryEnabled === true) {
+      if (source.type !== 'channel') throw new Error('Adaptive and Trending discovery are available for channel sources only');
       if (!forceAdaptive && source.adaptiveLastRunAt && Date.now() - new Date(source.adaptiveLastRunAt).getTime() < 24 * 3600000) {
         logger.info('adaptive_channel_scan_skipped_daily_limit', { sourceId: sourceKey, sourceName: source.name, lastRunAt: new Date(source.adaptiveLastRunAt).toISOString() });
         const completedAt = new Date();
         await ScanHistory.updateOne({ _id: history._id }, { $set: { completedAt, status: 'COMPLETED', errorCount: 0, errorDetails: [] } });
         return { sourceId: sourceKey, skipped: true, reason: 'adaptive discovery already ran in the last 24 hours' };
       }
-      const candidates = await runAdaptiveDiscovery(source);
-      const adaptiveResult = await processAdaptiveChannel(source, candidates);
+      const trending = source.trendingDiscoveryEnabled === true;
+      const candidates = await runAdaptiveDiscovery(source, trending ? { target: 90, lookbackDays: null } : {});
+      const adaptiveResult = await processAdaptiveChannel(source, candidates, { trending });
       inspected = adaptiveResult.inspected; matched = adaptiveResult.matched;
       const completedAt = new Date();
       await Source.updateOne({ _id: source._id }, { $set: { lastScannedAt: completedAt } });
       await ScanHistory.updateOne({ _id: history._id }, { $set: { completedAt, inspected, matched, rejected: 0, errorCount: 0, errorDetails: [], status: 'COMPLETED' } });
-      logger.info('source_scan_completed', { sourceId: sourceKey, sourceName: source.name, mode: 'ADAPTIVE_TOP_10', status: 'COMPLETED', inspected, matched, rejected: 0, errors: 0, durationMs: completedAt.getTime() - startedAt.getTime() });
-      return { sourceId: sourceKey, inspected, matched, rejected: 0, errors: 0, mode: 'ADAPTIVE_TOP_10' };
+      const mode = trending ? 'TRENDING_SURGE' : 'ADAPTIVE_TOP_10';
+      logger.info('source_scan_completed', { sourceId: sourceKey, sourceName: source.name, mode, status: 'COMPLETED', inspected, matched, rejected: 0, errors: 0, durationMs: completedAt.getTime() - startedAt.getTime() });
+      return { sourceId: sourceKey, inspected, matched, rejected: 0, errors: 0, mode };
     }
     const entries = await runYtDlp(source, limit);
     let geminiResults = { results: new Map(), skippedIds: new Set(), attempted: 0, error: null };
@@ -524,7 +570,10 @@ async function scanAll() {
   try {
     await migrateLegacyThumbnailSetting();
     const adaptiveDueAt = new Date(Date.now() - 24 * 3600000);
-    const sources = await Source.find({ enabled: true, $or: [{ adaptiveDiscoveryEnabled: { $ne: true } }, { adaptiveLastRunAt: null }, { adaptiveLastRunAt: { $lte: adaptiveDueAt } }] }).sort({ createdAt: 1 }).lean();
+    const sources = await Source.find({ enabled: true, $or: [
+      { $and: [{ adaptiveDiscoveryEnabled: { $ne: true } }, { trendingDiscoveryEnabled: { $ne: true } }] },
+      { adaptiveLastRunAt: null }, { adaptiveLastRunAt: { $lte: adaptiveDueAt } }
+    ] }).sort({ createdAt: 1 }).lean();
     logger.info('full_scan_started', { enabledSources: sources.length, defaultMaxEntriesPerSource: LIMIT, perSourceLimitsEnabled: true, adaptiveDailyFrequency: true });
     const results = [];
     for (const source of sources) results.push(await scanSource(source));

@@ -15,6 +15,7 @@ const sourceSchema = new Schema({
   type: { type: String, required: true, enum: ['channel', 'playlist', 'shorts'] },
   videosPerScan: { type: Number, default: defaultVideosPerScan, min: 1, max: 10000 },
   adaptiveDiscoveryEnabled: { type: Boolean, default: false },
+  trendingDiscoveryEnabled: { type: Boolean, default: false },
   adaptiveContentType: { type: String, enum: ['BOTH', 'VIDEOS', 'SHORTS'], default: 'BOTH' },
   adaptiveLastRunAt: { type: Date, default: null },
   scanDescription: { type: Boolean, default: true },
@@ -93,7 +94,10 @@ const adaptiveVideoSchema = new Schema({
   contentType: { type: String, enum: ['video', 'short'], default: 'video' },
   views: { type: Number, default: null }, likes: { type: Number, default: null }, comments: { type: Number, default: null },
   engagementRate: { type: Number, default: null }, engagementIncomplete: { type: Boolean, default: true },
-  statsUpdatedAt: { type: Date, default: null }, lastDailyViewGrowth: { type: Number, default: null }
+  statsUpdatedAt: { type: Date, default: null }, lastDailyViewGrowth: { type: Number, default: null },
+  lastDailyLikeGrowth: { type: Number, default: null }, viewSurge: { type: Boolean, default: false },
+  viewSurgeDetectedAt: { type: Date, default: null }, viewVelocityPerDay: { type: Number, default: null },
+  surgeThresholdPerDay: { type: Number, default: null }
 }, { timestamps: true, collection: 'adaptive_channel_videos' });
 adaptiveVideoSchema.index({ sourceId: 1, youtubeId: 1 }, { unique: true });
 adaptiveVideoSchema.index({ sourceId: 1, publishedAt: -1 });
@@ -105,6 +109,7 @@ const channelProfileSchema = new Schema({
   medianEngagementRate: { type: Number, default: null }, averageEngagementRate: { type: Number, default: null }, percentile75EngagementRate: { type: Number, default: null },
   averageUploadsPerDay7d: { type: Number, default: 0 }, averageUploadsPerDay30d: { type: Number, default: 0 }, uploadsLast24Hours: { type: Number, default: 0 },
   averageTimeBetweenUploadsHours: { type: Number, default: null }, averageDailyViewGrowth: { type: Number, default: null },
+  projectedUploadsNext15Days: { type: Number, default: null }, uploadRateReliable: { type: Boolean, default: false },
   minimumViewsThreshold: { type: Number, default: null }, thresholdSampleSize: { type: Number, default: 0 }, thresholdProvisional: { type: Boolean, default: true },
   thresholdMethod: { type: String, default: 'linear-interpolation' }, discoveryWindowDays: { type: Number, default: 90 }, calculatedAt: { type: Date, default: null }
 }, { timestamps: true, collection: 'channel_profiles' });
