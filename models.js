@@ -97,7 +97,7 @@ const adaptiveVideoSchema = new Schema({
   statsUpdatedAt: { type: Date, default: null }, lastDailyViewGrowth: { type: Number, default: null },
   lastDailyLikeGrowth: { type: Number, default: null }, viewSurge: { type: Boolean, default: false },
   viewSurgeDetectedAt: { type: Date, default: null }, viewVelocityPerDay: { type: Number, default: null },
-  surgeThresholdPerDay: { type: Number, default: null }
+  surgeThresholdPerDay: { type: Number, default: null }, rejectionReason: { type: String, default: '' }, matchedKeywords: { type: [String], default: [] }
 }, { timestamps: true, collection: 'adaptive_channel_videos' });
 adaptiveVideoSchema.index({ sourceId: 1, youtubeId: 1 }, { unique: true });
 adaptiveVideoSchema.index({ sourceId: 1, publishedAt: -1 });
@@ -117,7 +117,7 @@ const channelProfileSchema = new Schema({
 const channelRankingSchema = new Schema({
   sourceId: { type: Schema.Types.ObjectId, required: true }, channelId: { type: String, default: '' }, channelName: { type: String, default: '' },
   rankingDate: { type: Date, required: true }, rankingType: { type: String, enum: ['recent', 'engagement'], required: true },
-  entries: [{ youtubeId: String, rank: Number, title: String, thumbnail: String, videoUrl: String, publishedAt: Date, views: Number, likes: Number, comments: Number, engagementRate: Number, relativeEngagement: Number, queueStatus: String }]
+  entries: [{ youtubeId: String, rank: Number, title: String, thumbnail: String, videoUrl: String, publishedAt: Date, views: Number, likes: Number, comments: Number, engagementRate: Number, relativeEngagement: Number, queueStatus: String, accepted: Boolean, rejectionReason: String, matchedKeywords: [String] }]
 }, { timestamps: true, collection: 'channel_rankings' });
 channelRankingSchema.index({ sourceId: 1, rankingDate: -1, rankingType: 1 }, { unique: true });
 

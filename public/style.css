@@ -49,3 +49,4 @@ dialog::backdrop{background:#0009}
 
 .trending-filters{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 14px}.trending-filters .source-filter select{max-width:200px}.trending-filters .sort-control select{max-width:220px}.trending-table{min-width:1320px}.status-pair{display:flex;flex-direction:column;align-items:flex-start;gap:5px;min-width:118px}.status-pair .badge{font-size:8px;letter-spacing:.15px;padding:4px 7px;white-space:nowrap}.badge.AWAITING_APPROVAL,.badge.PROCESSING,.badge.SENT{background:#e8edff;color:#6673b8}.badge.NOT_QUEUED{background:#eff3f2;color:#6c797c}
 .status-line{display:flex;align-items:center;gap:5px}.status-line small{width:38px;color:var(--muted);font-size:9px}
+.rejection-reason{color:var(--red);font-size:11px;font-weight:600;max-width:260px;display:inline-block;white-space:normal}

@@ -142,11 +142,13 @@ function findMatches(source, entry, description = entry.description || '', thumb
     ? rule.test(originalText.slice(0, 8000))
     : text.includes(pattern.normalize('NFC').toLocaleLowerCase());
   const excludes = (source.excludeKeywords || []).filter(Boolean);
-  if (excludes.some((k, index) => matchesPattern(k, regexRules?.excludes[index]))) return { accepted: false, matches: [], excluded: true };
+  const excludedKeyword = excludes.find((k, index) => matchesPattern(k, regexRules?.excludes[index]));
+  if (excludedKeyword) return { accepted: false, matches: [], excluded: true, rejectionReason: `Excluded by keyword: ${excludedKeyword}` };
   const includes = (source.keywords || []).filter(Boolean);
   if (!includes.length) return { accepted: true, matches: [], excluded: false };
   const matches = includes.filter((k, index) => matchesPattern(k, regexRules?.includes[index]));
-  return { accepted: source.matchMode === 'ALL' ? matches.length === includes.length : matches.length > 0, matches, excluded: false };
+  const accepted = source.matchMode === 'ALL' ? matches.length === includes.length : matches.length > 0;
+  return { accepted, matches, excluded: false, rejectionReason: accepted ? '' : `Did not match ${source.matchMode || 'ANY'} include keyword rule (${includes.join(', ')})` };
 }
 async function thumbnailTextFromUrl(url, visualReferences = []) {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -446,6 +448,20 @@ async function processAdaptiveChannel(source, entries, { trending = false } = {}
     for (const item of ranked.recent) queueSelection.set(item.youtubeId, [`adaptive-recent-top-10-rank-${item.rank}`]);
     for (const item of ranked.engagement) queueSelection.set(item.youtubeId, [...(queueSelection.get(item.youtubeId) || []), `adaptive-engagement-top-10-rank-${item.rank}`]);
   }
+  const rejectedSelections = new Map();
+  for (const [id] of queueSelection) {
+    const entry = entriesById.get(id);
+    const item = videos.find(video => video.youtubeId === id);
+    if (!entry || !item) continue;
+    const keywordResult = findMatches(source, entry, entry.description || item.description || '');
+    const rejectionReason = keywordResult.rejectionReason;
+    if (!keywordResult.accepted) {
+      rejectedSelections.set(id, rejectionReason || 'Did not match keyword rules');
+      await AdaptiveVideo.updateOne({ sourceId, youtubeId: id }, { $set: { rejectionReason: rejectionReason || 'Did not match keyword rules', matchedKeywords: [] } });
+      queueSelection.delete(id);
+    } else await AdaptiveVideo.updateOne({ sourceId, youtubeId: id }, { $set: { rejectionReason: '', matchedKeywords: keywordResult.matches } });
+  }
+  const annotate = list => list.map(item => ({ ...item, accepted: !rejectedSelections.has(item.youtubeId), rejectionReason: rejectedSelections.get(item.youtubeId) || '', matchedKeywords: entriesById.has(item.youtubeId) ? findMatches(source, entriesById.get(item.youtubeId)).matches : [] }));
   let newQueueEntries = 0;
   for (const [id, labels] of queueSelection) {
     const entry = entriesById.get(id);
@@ -455,8 +471,8 @@ async function processAdaptiveChannel(source, entries, { trending = false } = {}
   const queueStates = new Map(queueItems.map(item => [item.youtubeId, `${item.approvalStatus}/${item.status}`]));
   const withQueueStatus = list => list.map(item => ({ ...item, queueStatus: queueStates.get(item.youtubeId) || 'NOT_QUEUED' }));
   await Promise.all([
-    ChannelRanking.updateOne({ sourceId, rankingDate, rankingType: 'recent' }, { $set: { sourceId, channelId: profile.channelId, channelName: profile.channelName, rankingDate, rankingType: 'recent', entries: withQueueStatus(ranked.recent) } }, { upsert: true }),
-    ChannelRanking.updateOne({ sourceId, rankingDate, rankingType: 'engagement' }, { $set: { sourceId, channelId: profile.channelId, channelName: profile.channelName, rankingDate, rankingType: 'engagement', entries: withQueueStatus(ranked.engagement) } }, { upsert: true }),
+    ChannelRanking.updateOne({ sourceId, rankingDate, rankingType: 'recent' }, { $set: { sourceId, channelId: profile.channelId, channelName: profile.channelName, rankingDate, rankingType: 'recent', entries: withQueueStatus(annotate(ranked.recent)) } }, { upsert: true }),
+    ChannelRanking.updateOne({ sourceId, rankingDate, rankingType: 'engagement' }, { $set: { sourceId, channelId: profile.channelId, channelName: profile.channelName, rankingDate, rankingType: 'engagement', entries: withQueueStatus(annotate(ranked.engagement)) } }, { upsert: true }),
     Source.updateOne({ _id: sourceId }, { $set: { adaptiveLastRunAt: seenAt } })
   ]);
   source.adaptiveLastRunAt = seenAt;
@@ -467,7 +483,7 @@ async function processAdaptiveChannel(source, entries, { trending = false } = {}
     trending, viewSurges: surges.length, surgeThresholdPerDay: surgeThreshold,
     projectedUploadsNext15Days: profile.projectedUploadsNext15Days, uploadRateReliable: profile.uploadRateReliable, newQueueEntries
   });
-  return { inspected: videos.length, matched: detectedForQueue, queued: newQueueEntries, viewSurges: surges.length, projectedUploadsNext15Days: profile.projectedUploadsNext15Days };
+  return { inspected: videos.length, matched: detectedForQueue, rejected: rejectedSelections.size, queued: newQueueEntries, viewSurges: surges.length, projectedUploadsNext15Days: profile.projectedUploadsNext15Days };
 }
 async function scanSource(source, { forceAdaptive = false } = {}) {
   const sourceKey = String(source._id);
@@ -501,13 +517,13 @@ async function scanSource(source, { forceAdaptive = false } = {}) {
       const trending = source.trendingDiscoveryEnabled === true;
       const candidates = await runAdaptiveDiscovery(source, trending ? { target: 90, lookbackDays: null } : {});
       const adaptiveResult = await processAdaptiveChannel(source, candidates, { trending });
-      inspected = adaptiveResult.inspected; matched = adaptiveResult.matched;
+      inspected = adaptiveResult.inspected; matched = adaptiveResult.matched; rejected = adaptiveResult.rejected || 0;
       const completedAt = new Date();
       await Source.updateOne({ _id: source._id }, { $set: { lastScannedAt: completedAt } });
-      await ScanHistory.updateOne({ _id: history._id }, { $set: { completedAt, inspected, matched, rejected: 0, errorCount: 0, errorDetails: [], status: 'COMPLETED' } });
+      await ScanHistory.updateOne({ _id: history._id }, { $set: { completedAt, inspected, matched, rejected, errorCount: 0, errorDetails: [], status: 'COMPLETED' } });
       const mode = trending ? 'TRENDING_SURGE' : 'ADAPTIVE_TOP_10';
-      logger.info('source_scan_completed', { sourceId: sourceKey, sourceName: source.name, mode, status: 'COMPLETED', inspected, matched, rejected: 0, errors: 0, durationMs: completedAt.getTime() - startedAt.getTime() });
-      return { sourceId: sourceKey, inspected, matched, rejected: 0, errors: 0, mode };
+      logger.info('source_scan_completed', { sourceId: sourceKey, sourceName: source.name, mode, status: 'COMPLETED', inspected, matched, rejected, errors: 0, durationMs: completedAt.getTime() - startedAt.getTime() });
+      return { sourceId: sourceKey, inspected, matched, rejected, errors: 0, mode };
     }
     const entries = await runYtDlp(source, limit);
     let geminiResults = { results: new Map(), skippedIds: new Set(), attempted: 0, error: null };
