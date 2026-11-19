@@ -189,6 +189,8 @@ function showSource(source = null) {
   form.elements.videosPerScan.value = source?.videosPerScan || 50;
   form.elements.adaptiveDiscoveryEnabled.checked = source?.adaptiveDiscoveryEnabled ?? false;
   form.elements.trendingDiscoveryEnabled.checked = source?.trendingDiscoveryEnabled ?? false;
+  form.elements.dailyTopVideosEnabled.checked = source?.dailyTopVideosEnabled ?? false;
+  form.elements.dailyTopVideosCount.value = source?.dailyTopVideosCount ?? 1;
   form.elements.adaptiveContentType.value = source?.adaptiveContentType ?? 'BOTH';
   form.elements.generateNfo.checked = source?.generateNfo ?? false;
   form.elements.thumbnailGeminiEnabled.checked = source?.thumbnailGeminiEnabled ?? false;
@@ -213,8 +215,11 @@ function showSource(source = null) {
   $('#adaptiveDiscoveryField').hidden = form.elements.type.value !== 'channel';
   $('#adaptiveDiscoveryHelp').hidden = form.elements.type.value !== 'channel';
   $('#trendingDiscoveryField').hidden = form.elements.type.value !== 'channel';
+  $('#dailyTopVideosField').hidden = form.elements.type.value !== 'channel';
+  $('#dailyTopVideosHelp').hidden = form.elements.type.value !== 'channel';
+  $('#dailyTopVideosCountField').hidden = form.elements.type.value !== 'channel' || !form.elements.dailyTopVideosEnabled.checked;
   $('#trendingDiscoveryHelp').hidden = form.elements.type.value !== 'channel';
-  $('#adaptiveContentTypeField').hidden = form.elements.type.value !== 'channel' || !(form.elements.adaptiveDiscoveryEnabled.checked || form.elements.trendingDiscoveryEnabled.checked);
+  $('#adaptiveContentTypeField').hidden = form.elements.type.value !== 'channel' || !(form.elements.adaptiveDiscoveryEnabled.checked || form.elements.trendingDiscoveryEnabled.checked || form.elements.dailyTopVideosEnabled.checked);
   form.dataset.keywordSearchMode = form.elements.keywordSearchMode.value;
   form.elements.keywords.value = formatKeywordEntries(source?.keywords || [], form.elements.keywordSearchMode.value);
   form.elements.excludeKeywords.value = formatKeywordEntries(source?.excludeKeywords || [], form.elements.keywordSearchMode.value);
@@ -222,8 +227,9 @@ function showSource(source = null) {
   $('#sourceDialog').showModal();
 }
 $('#sourceForm').elements.visualMatchEnabled.addEventListener('change', e => { $('#visualAutoApproveField').hidden = !e.target.checked || e.currentTarget.form.elements.visualMatchAction.value === 'REJECT'; $('#visualMatchActionField').hidden = !e.target.checked; });
-$('#sourceForm').elements.adaptiveDiscoveryEnabled.addEventListener('change', e => { const form = e.currentTarget.form; if (e.target.checked) form.elements.trendingDiscoveryEnabled.checked = false; $('#adaptiveContentTypeField').hidden = form.elements.type.value !== 'channel' || !(e.target.checked || form.elements.trendingDiscoveryEnabled.checked); });
-$('#sourceForm').elements.trendingDiscoveryEnabled.addEventListener('change', e => { const form = e.currentTarget.form; if (e.target.checked) form.elements.adaptiveDiscoveryEnabled.checked = false; $('#adaptiveContentTypeField').hidden = form.elements.type.value !== 'channel' || !(e.target.checked || form.elements.adaptiveDiscoveryEnabled.checked); });
+$('#sourceForm').elements.adaptiveDiscoveryEnabled.addEventListener('change', e => { const form = e.currentTarget.form; if (e.target.checked) { form.elements.trendingDiscoveryEnabled.checked = false; form.elements.dailyTopVideosEnabled.checked = false; } $('#dailyTopVideosCountField').hidden = form.elements.type.value !== 'channel' || !form.elements.dailyTopVideosEnabled.checked; $('#adaptiveContentTypeField').hidden = form.elements.type.value !== 'channel' || !(e.target.checked || form.elements.trendingDiscoveryEnabled.checked); });
+$('#sourceForm').elements.trendingDiscoveryEnabled.addEventListener('change', e => { const form = e.currentTarget.form; if (e.target.checked) { form.elements.adaptiveDiscoveryEnabled.checked = false; form.elements.dailyTopVideosEnabled.checked = false; } $('#dailyTopVideosCountField').hidden = form.elements.type.value !== 'channel' || !form.elements.dailyTopVideosEnabled.checked; $('#adaptiveContentTypeField').hidden = form.elements.type.value !== 'channel' || !(e.target.checked || form.elements.adaptiveDiscoveryEnabled.checked); });
+$('#sourceForm').elements.dailyTopVideosEnabled.addEventListener('change', e => { const form=e.currentTarget.form; if(e.target.checked){form.elements.adaptiveDiscoveryEnabled.checked=false;form.elements.trendingDiscoveryEnabled.checked=false;} $('#dailyTopVideosCountField').hidden=form.elements.type.value!=='channel'||!e.target.checked; $('#adaptiveContentTypeField').hidden=form.elements.type.value!=='channel'||!(form.elements.adaptiveDiscoveryEnabled.checked||form.elements.trendingDiscoveryEnabled.checked||e.target.checked); });
 $('#sourceForm').elements.visualMatchAction.addEventListener('change', e => { $('#visualAutoApproveField').hidden = !e.currentTarget.form.elements.visualMatchEnabled.checked || e.target.value === 'REJECT'; });
 $('#sourceForm').elements.keywordSearchMode.addEventListener('change', e => {
   const form = e.currentTarget.form; const oldMode = form.dataset.keywordSearchMode || 'TEXT'; const newMode = e.target.value;
@@ -262,7 +268,7 @@ $('#removeVisualReference').addEventListener('click', async () => {
     toast('All reference images removed');
   } catch (err) { toast(err.message, true); }
 });
-$('#sourceForm').elements.type.addEventListener('change', e => { const form = e.currentTarget.form; $('#autoApproveField').hidden = e.target.value !== 'channel'; $('#adaptiveDiscoveryField').hidden = e.target.value !== 'channel'; $('#adaptiveDiscoveryHelp').hidden = e.target.value !== 'channel'; $('#trendingDiscoveryField').hidden = e.target.value !== 'channel'; $('#trendingDiscoveryHelp').hidden = e.target.value !== 'channel'; $('#adaptiveContentTypeField').hidden = e.target.value !== 'channel' || !(form.elements.adaptiveDiscoveryEnabled.checked || form.elements.trendingDiscoveryEnabled.checked); });
+$('#sourceForm').elements.type.addEventListener('change', e => { const form = e.currentTarget.form; $('#autoApproveField').hidden = e.target.value !== 'channel'; $('#adaptiveDiscoveryField').hidden = e.target.value !== 'channel'; $('#adaptiveDiscoveryHelp').hidden = e.target.value !== 'channel'; $('#trendingDiscoveryField').hidden = e.target.value !== 'channel'; $('#trendingDiscoveryHelp').hidden = e.target.value !== 'channel'; $('#dailyTopVideosField').hidden = e.target.value !== 'channel'; $('#dailyTopVideosHelp').hidden = e.target.value !== 'channel'; $('#dailyTopVideosCountField').hidden = e.target.value !== 'channel' || !form.elements.dailyTopVideosEnabled.checked; $('#adaptiveContentTypeField').hidden = e.target.value !== 'channel' || !(form.elements.adaptiveDiscoveryEnabled.checked || form.elements.trendingDiscoveryEnabled.checked || form.elements.dailyTopVideosEnabled.checked); });
 function splitWords(s) { return s.split(',').map(x => x.trim()).filter(Boolean); }
 function parseKeywordEntries(value, mode = 'TEXT') {
   return mode === 'REGEX' ? value.split(/\r?\n/).map(part => part.trim()).filter(Boolean) : splitWords(value);
@@ -324,7 +330,7 @@ $('#content').addEventListener('click', async e => {
       const inspected = r.inspected ?? r.result?.inspected;
       if (r.skipped) toast(`Scan skipped: ${r.reason || 'source was not scanned'}`);
       else if (Number.isFinite(Number(matched)) && Number.isFinite(Number(errors))) {
-        toast(`Scan complete: ${matched} matches, ${errors} errors${Number.isFinite(Number(inspected)) ? ` (${inspected} inspected)` : ''}${r.mode === 'ADAPTIVE_TOP_10' ? ' · Adaptive Top 10' : ''}`);
+        toast(`Scan complete: ${matched} matches, ${errors} errors${Number.isFinite(Number(inspected)) ? ` (${inspected} inspected)` : ''}${r.mode === 'ADAPTIVE_TOP_10' ? ' · Adaptive Top 10' : r.mode === 'DAILY_TOP_VIDEOS' ? ` · Daily Top Videos${r.queued != null ? ` · ${r.queued} new queue entries` : ''}` : ''}`);
       } else toast('Scan finished, but the server returned an unrecognized result. Check Scan History for details.', true);
     }
     await render();
@@ -371,6 +377,8 @@ $('#sourceForm').addEventListener('submit', async e => {
     priority: f.elements.priority.value, matchMode: f.elements.matchMode.value, enabled: f.elements.enabled.checked,
     adaptiveDiscoveryEnabled: f.elements.type.value === 'channel' && f.elements.adaptiveDiscoveryEnabled.checked,
     trendingDiscoveryEnabled: f.elements.type.value === 'channel' && f.elements.trendingDiscoveryEnabled.checked,
+    dailyTopVideosEnabled: f.elements.type.value === 'channel' && f.elements.dailyTopVideosEnabled.checked,
+    dailyTopVideosCount: Number(f.elements.dailyTopVideosCount.value),
     adaptiveContentType: f.elements.adaptiveContentType.value,
     videosPerScan: Number(f.elements.videosPerScan.value), scanDescription: f.elements.scanDescription.checked || f.elements.generateNfo.checked,
     generateNfo: f.elements.generateNfo.checked, thumbnailGeminiEnabled: f.elements.thumbnailGeminiEnabled.checked,

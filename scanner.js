@@ -187,7 +187,7 @@ async function thumbnailTextFromUrl(url, visualReferences = []) {
   if (!Array.isArray(analysis.matched_reference_indices) || typeof analysis.thumbnail_text !== 'string' || analysis.matched_reference_indices.some(index => !Number.isInteger(index) || index < 0 || index >= visualReferences.length)) throw new Error('Gemini returned an invalid visual match result');
   return { text: analysis.thumbnail_text, visualMatchIndices: [...new Set(analysis.matched_reference_indices)] };
 }
-async function scanNewGeminiThumbnails(source, entries) {
+async function scanNewGeminiThumbnails(source, entries, { bypassCursor = false, queueAccepted = true } = {}) {
   const results = new Map();
   let visualReferences = [];
   if (source.visualMatchEnabled) {
@@ -243,7 +243,7 @@ async function scanNewGeminiThumbnails(source, entries) {
       return { results, skippedIds: new Set(), attempted: 0, error: { youtubeId: null, message: err.message } };
     }
   }
-  const cursor = source.geminiLastScannedVideoId || '';
+  const cursor = bypassCursor ? '' : source.geminiLastScannedVideoId || '';
   const cursorIndex = cursor ? entries.findIndex(entry => videoId(entry) === cursor) : -1;
   let candidates; let skippedEntries = [];
   if (source.type === 'playlist') {
@@ -264,7 +264,10 @@ async function scanNewGeminiThumbnails(source, entries) {
       attempted++;
       logger.gemini('REQUEST', { model: 'gemini-3.1-flash-lite', sourceId: String(source._id), sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), visualReferenceCount: visualReferences.length, visualMatchAction: source.visualMatchAction || 'ACCEPT' });
       const analysis = await thumbnailTextFromUrl(thumbnail, visualReferences);
-      const keywordMatch = findMatches(source, entry, entry.description || '', analysis.text);
+      const description = source.generateNfo === true
+        ? await descriptionFromNfo(source, entry, id)
+        : source.scanDescription === false ? '' : (entry.description || '');
+      const keywordMatch = findMatches(source, entry, description, analysis.text);
       const hasIncludes = (source.keywords || []).some(Boolean);
       const visualMatch = analysis.visualMatchIndices.length > 0;
       const action = source.visualMatchAction || 'ACCEPT';
@@ -274,7 +277,7 @@ async function scanNewGeminiThumbnails(source, entries) {
       const matches = [...keywordMatch.matches];
       if (visualMatch) matches.push('visual-reference-match');
       const match = { accepted, matches, excluded: keywordMatch.excluded };
-      if (match.accepted) await upsertVideo(source, entry, match.matches);
+      if (match.accepted && queueAccepted) await upsertVideo(source, entry, match.matches);
       await Source.updateOne({ _id: source._id }, { $set: { geminiLastScannedVideoId: id } });
       source.geminiLastScannedVideoId = id;
       results.set(id, { accepted: match.accepted, matches: match.matches, text: analysis.text });
@@ -485,6 +488,58 @@ async function processAdaptiveChannel(source, entries, { trending = false } = {}
   });
   return { inspected: videos.length, matched: detectedForQueue, rejected: rejectedSelections.size, queued: newQueueEntries, viewSurges: surges.length, projectedUploadsNext15Days: profile.projectedUploadsNext15Days };
 }
+async function processDailyTopVideos(source, entries) {
+  const now = new Date();
+  const ids = entries.map(videoId).filter(Boolean);
+  const geminiEnabled = source.thumbnailGeminiEnabled === true || source.visualMatchEnabled === true;
+  const gemini = geminiEnabled
+    ? await scanNewGeminiThumbnails(source, entries, { bypassCursor: true, queueAccepted: false })
+    : { results: new Map(), skippedIds: new Set(), attempted: 0, error: null };
+  for (const entry of entries) {
+    const id = videoId(entry); const publishedAt = entry._adaptivePublishedAt || entryPublishedAt(entry);
+    if (!id || !publishedAt) continue;
+    const views = optionalNumber(entry.view_count); const likes = optionalNumber(entry.like_count);
+    const comments = optionalNumber(entry.comment_count);
+    const engagementRate = views > 0 && likes !== null && comments !== null ? ((likes + comments) / views) * 100 : null;
+    await AdaptiveVideo.updateOne({ sourceId: source._id, youtubeId: id }, { $set: {
+      sourceId: source._id, youtubeId: id, channelId: entry.channel_id || '', channelName: entry.channel || source.name,
+      title: entry.title || '', description: entry.description || '', thumbnail: entry.thumbnail || entry.thumbnails?.at(-1)?.url || '',
+      videoUrl: videoUrl(entry, id), publishedAt, duration: optionalNumber(entry.duration), contentType: entry._adaptiveContentType || 'video',
+      views, likes, comments, engagementRate, engagementIncomplete: engagementRate === null, statsUpdatedAt: now
+    } }, { upsert: true });
+    const capturedAt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    await VideoStatsHistory.updateOne({ sourceId: source._id, youtubeId: id, capturedAt }, {
+      $setOnInsert: { sourceId: source._id, youtubeId: id, channelId: entry.channel_id || '', capturedAt },
+      $set: { views, likes, comments, engagementRate }
+    }, { upsert: true });
+  }
+  const passing = [];
+  let rejected = 0;
+  for (const entry of entries) {
+    const id = videoId(entry); if (!id) continue;
+    let result;
+    if (geminiEnabled) result = gemini.results.get(id);
+    else {
+      const description = source.generateNfo === true ? await descriptionFromNfo(source, entry, id) : (entry.description || '');
+      result = findMatches(source, entry, description);
+    }
+    if (!result?.accepted || gemini.skippedIds.has(id)) { rejected++; continue; }
+    passing.push({ entry, result });
+  }
+  const count = Math.min(10, Math.max(1, Number(source.dailyTopVideosCount) || 1));
+  const selected = passing.sort((a, b) => (Number(b.entry.view_count) || 0) - (Number(a.entry.view_count) || 0)).slice(0, count);
+  let queued = 0;
+  for (const { entry, result } of selected) queued += await upsertVideo(source, entry, result.matches || []);
+  await ChannelRanking.updateOne({ sourceId: source._id, rankingDate: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())), rankingType: 'top-one' }, {
+    $set: { sourceId: source._id, channelId: entries.find(entry => entry.channel_id)?.channel_id || '', channelName: source.name,
+      rankingDate: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())), rankingType: 'top-one',
+      entries: selected.map(({ entry, result }, index) => ({ youtubeId: videoId(entry), rank: index + 1, title: entry.title || '',
+        thumbnail: entry.thumbnail || entry.thumbnails?.at(-1)?.url || '', videoUrl: videoUrl(entry, videoId(entry)), publishedAt: entry._adaptivePublishedAt || entryPublishedAt(entry),
+        views: optionalNumber(entry.view_count), likes: optionalNumber(entry.like_count), accepted: true, matchedKeywords: result.matches || [], queueStatus: 'QUEUED' })) }
+  }, { upsert: true });
+  await Source.updateOne({ _id: source._id }, { $set: { adaptiveLastRunAt: now } });
+  return { inspected: entries.length, matched: passing.length, rejected, queued, selected: selected.length, geminiAttempted: gemini.attempted, error: gemini.error };
+}
 async function scanSource(source, { forceAdaptive = false } = {}) {
   const sourceKey = String(source._id);
   if (activeSources.has(sourceKey)) return { skipped: true, reason: 'source scan already running' };
@@ -506,8 +561,8 @@ async function scanSource(source, { forceAdaptive = false } = {}) {
   }, 60_000);
   logger.info('source_scan_started', { sourceId: sourceKey, sourceName: source.name, sourceType: source.type, maxEntries: source.trendingDiscoveryEnabled === true ? 90 : limit, scanDescription: source.scanDescription !== false, generateNfo: source.generateNfo === true, thumbnailGeminiEnabled: source.thumbnailGeminiEnabled === true, visualMatchEnabled: source.visualMatchEnabled === true });
   try {
-    if (source.adaptiveDiscoveryEnabled === true || source.trendingDiscoveryEnabled === true) {
-      if (source.type !== 'channel') throw new Error('Adaptive and Trending discovery are available for channel sources only');
+    if (source.dailyTopVideosEnabled === true || source.adaptiveDiscoveryEnabled === true || source.trendingDiscoveryEnabled === true) {
+      if (source.type !== 'channel') throw new Error('Adaptive, Daily Top Videos, and Trending discovery are available for channel sources only');
       if (!forceAdaptive && source.adaptiveLastRunAt && Date.now() - new Date(source.adaptiveLastRunAt).getTime() < 24 * 3600000) {
         logger.info('adaptive_channel_scan_skipped_daily_limit', { sourceId: sourceKey, sourceName: source.name, lastRunAt: new Date(source.adaptiveLastRunAt).toISOString() });
         const completedAt = new Date();
@@ -515,15 +570,17 @@ async function scanSource(source, { forceAdaptive = false } = {}) {
         return { sourceId: sourceKey, skipped: true, reason: 'adaptive discovery already ran in the last 24 hours' };
       }
       const trending = source.trendingDiscoveryEnabled === true;
-      const candidates = await runAdaptiveDiscovery(source, trending ? { target: 90, lookbackDays: null } : {});
-      const adaptiveResult = await processAdaptiveChannel(source, candidates, { trending });
+      const dailyTop = source.dailyTopVideosEnabled === true;
+      const candidates = await runAdaptiveDiscovery(source, dailyTop ? { target: 10000, lookbackDays: 7 } : trending ? { target: 90, lookbackDays: null } : {});
+      const adaptiveResult = dailyTop ? await processDailyTopVideos(source, candidates) : await processAdaptiveChannel(source, candidates, { trending });
       inspected = adaptiveResult.inspected; matched = adaptiveResult.matched; rejected = adaptiveResult.rejected || 0;
+      if (adaptiveResult.error) errors.push(`Gemini: ${adaptiveResult.error.message}`);
       const completedAt = new Date();
       await Source.updateOne({ _id: source._id }, { $set: { lastScannedAt: completedAt } });
-      await ScanHistory.updateOne({ _id: history._id }, { $set: { completedAt, inspected, matched, rejected, errorCount: 0, errorDetails: [], status: 'COMPLETED' } });
-      const mode = trending ? 'TRENDING_SURGE' : 'ADAPTIVE_TOP_10';
-      logger.info('source_scan_completed', { sourceId: sourceKey, sourceName: source.name, mode, status: 'COMPLETED', inspected, matched, rejected, errors: 0, durationMs: completedAt.getTime() - startedAt.getTime() });
-      return { sourceId: sourceKey, inspected, matched, rejected, errors: 0, mode };
+      await ScanHistory.updateOne({ _id: history._id }, { $set: { completedAt, inspected, matched, rejected, errorCount: errors.length, errorDetails: errors, status: errors.length ? 'PARTIAL' : 'COMPLETED' } });
+      const mode = dailyTop ? 'DAILY_TOP_VIDEOS' : trending ? 'TRENDING_SURGE' : 'ADAPTIVE_TOP_10';
+      logger.info('source_scan_completed', { sourceId: sourceKey, sourceName: source.name, mode, status: errors.length ? 'PARTIAL' : 'COMPLETED', inspected, matched, rejected, errors: errors.length, durationMs: completedAt.getTime() - startedAt.getTime() });
+      return { sourceId: sourceKey, inspected, matched, rejected, errors: errors.length, mode, queued: adaptiveResult.queued, geminiAttempted: adaptiveResult.geminiAttempted };
     }
     const entries = await runYtDlp(source, limit);
     let geminiResults = { results: new Map(), skippedIds: new Set(), attempted: 0, error: null };
@@ -587,7 +644,7 @@ async function scanAll() {
     await migrateLegacyThumbnailSetting();
     const adaptiveDueAt = new Date(Date.now() - 24 * 3600000);
     const sources = await Source.find({ enabled: true, $or: [
-      { $and: [{ adaptiveDiscoveryEnabled: { $ne: true } }, { trendingDiscoveryEnabled: { $ne: true } }] },
+      { $and: [{ adaptiveDiscoveryEnabled: { $ne: true } }, { trendingDiscoveryEnabled: { $ne: true } }, { dailyTopVideosEnabled: { $ne: true } }] },
       { adaptiveLastRunAt: null }, { adaptiveLastRunAt: { $lte: adaptiveDueAt } }
     ] }).sort({ createdAt: 1 }).lean();
     logger.info('full_scan_started', { enabledSources: sources.length, defaultMaxEntriesPerSource: LIMIT, perSourceLimitsEnabled: true, adaptiveDailyFrequency: true });

@@ -37,7 +37,7 @@ function cleanKeywords(value) {
 function sourceInput(body, partial = false) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw Object.assign(new Error('JSON object required'), { status: 400 });
   const out = {};
-  for (const key of ['name', 'url', 'type', 'matchMode', 'priority', 'enabled', 'autoApproveVideos', 'adaptiveDiscoveryEnabled', 'trendingDiscoveryEnabled', 'adaptiveContentType', 'visualMatchEnabled', 'visualMatchAutoApprove', 'visualMatchAction', 'keywordSearchMode', 'videosPerScan', 'scanDescription', 'generateNfo', 'thumbnailGeminiEnabled', 'keywords', 'excludeKeywords']) {
+  for (const key of ['name', 'url', 'type', 'matchMode', 'priority', 'enabled', 'autoApproveVideos', 'adaptiveDiscoveryEnabled', 'trendingDiscoveryEnabled', 'dailyTopVideosEnabled', 'dailyTopVideosCount', 'adaptiveContentType', 'visualMatchEnabled', 'visualMatchAutoApprove', 'visualMatchAction', 'keywordSearchMode', 'videosPerScan', 'scanDescription', 'generateNfo', 'thumbnailGeminiEnabled', 'keywords', 'excludeKeywords']) {
     if (!(key in body)) continue;
     const value = body[key];
     if (key === 'name') { if (typeof value !== 'string' || !value.trim() || value.length > 160) throw Object.assign(new Error('Name is required (max 160 chars)'), { status: 400 }); out.name = value.trim(); }
@@ -51,6 +51,8 @@ function sourceInput(body, partial = false) {
     else if (key === 'autoApproveVideos') { if (typeof value !== 'boolean') throw Object.assign(new Error('autoApproveVideos must be boolean'), { status: 400 }); out.autoApproveVideos = value; }
     else if (key === 'adaptiveDiscoveryEnabled') { if (typeof value !== 'boolean') throw Object.assign(new Error('adaptiveDiscoveryEnabled must be boolean'), { status: 400 }); out.adaptiveDiscoveryEnabled = value; }
     else if (key === 'trendingDiscoveryEnabled') { if (typeof value !== 'boolean') throw Object.assign(new Error('trendingDiscoveryEnabled must be boolean'), { status: 400 }); out.trendingDiscoveryEnabled = value; }
+    else if (key === 'dailyTopVideosEnabled') { if (typeof value !== 'boolean') throw Object.assign(new Error('dailyTopVideosEnabled must be boolean'), { status: 400 }); out.dailyTopVideosEnabled = value; }
+    else if (key === 'dailyTopVideosCount') { if (!Number.isInteger(value) || value < 1 || value > 10) throw Object.assign(new Error('dailyTopVideosCount must be an integer from 1 to 10'), { status: 400 }); out.dailyTopVideosCount = value; }
     else if (key === 'adaptiveContentType') { if (!['BOTH', 'VIDEOS', 'SHORTS'].includes(value)) throw Object.assign(new Error('adaptiveContentType must be BOTH, VIDEOS, or SHORTS'), { status: 400 }); out.adaptiveContentType = value; }
     else if (key === 'videosPerScan') { if (!Number.isInteger(value) || value < 1 || value > 10000) throw Object.assign(new Error('videosPerScan must be an integer from 1 to 10000'), { status: 400 }); out.videosPerScan = value; }
     else if (key === 'scanDescription' || key === 'generateNfo' || key === 'thumbnailGeminiEnabled' || key === 'visualMatchEnabled' || key === 'visualMatchAutoApprove') { if (typeof value !== 'boolean') throw Object.assign(new Error(`${key} must be boolean`), { status: 400 }); out[key] = value; }
@@ -59,8 +61,11 @@ function sourceInput(body, partial = false) {
   if (out.type && out.type !== 'channel' && out.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 });
   if (out.type && out.type !== 'channel' && out.adaptiveDiscoveryEnabled) throw Object.assign(new Error('Adaptive Top 10 discovery is only available for channel sources'), { status: 400 });
   if (out.type && out.type !== 'channel' && out.trendingDiscoveryEnabled) throw Object.assign(new Error('Trending discovery is only available for channel sources'), { status: 400 });
+  if (out.type && out.type !== 'channel' && out.dailyTopVideosEnabled) throw Object.assign(new Error('Daily Top Videos is only available for channel sources'), { status: 400 });
+  if (out.dailyTopVideosEnabled === true) { out.adaptiveDiscoveryEnabled = false; out.trendingDiscoveryEnabled = false; }
   if (out.trendingDiscoveryEnabled === true) out.adaptiveDiscoveryEnabled = false;
   if (out.adaptiveDiscoveryEnabled === true) out.trendingDiscoveryEnabled = false;
+  if (out.trendingDiscoveryEnabled === true || out.adaptiveDiscoveryEnabled === true) out.dailyTopVideosEnabled = false;
   if (out.type && out.type !== 'channel' && out.autoApproveVideos === undefined) out.autoApproveVideos = false;
   if (out.keywordSearchMode === 'REGEX') {
     try { validateRegexList(out.keywords || []); validateRegexList(out.excludeKeywords || []); }
@@ -174,10 +179,11 @@ app.put('/api/sources/:id', async (req, res, next) => {
   try {
     objectId(req.params.id);
     const updates = sourceInput(req.body, true);
-    const current = await Source.findById(req.params.id).select('type adaptiveDiscoveryEnabled visualReferences visualReferenceMimeType visualMatchEnabled visualMatchAction keywordSearchMode keywords excludeKeywords');
+    const current = await Source.findById(req.params.id).select('type adaptiveDiscoveryEnabled dailyTopVideosEnabled visualReferences visualReferenceMimeType visualMatchEnabled visualMatchAction keywordSearchMode keywords excludeKeywords');
     if (!current) return res.status(404).json({ error: 'Source not found' });
     if ((updates.type || current.type) !== 'channel' && updates.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 });
     if ((updates.type || current.type) !== 'channel' && (updates.adaptiveDiscoveryEnabled ?? current.adaptiveDiscoveryEnabled)) throw Object.assign(new Error('Adaptive Top 10 discovery is only available for channel sources'), { status: 400 });
+    if ((updates.type || current.type) !== 'channel' && (updates.dailyTopVideosEnabled ?? current.dailyTopVideosEnabled)) throw Object.assign(new Error('Daily Top Videos is only available for channel sources'), { status: 400 });
     if (updates.visualMatchEnabled === true && !current.visualReferences.length && !current.visualReferenceMimeType) throw Object.assign(new Error('Upload a reference image before enabling visual matching'), { status: 400 });
     if ((updates.keywordSearchMode || current.keywordSearchMode) === 'REGEX') {
       try { validateRegexList(updates.keywords || current.keywords || []); validateRegexList(updates.excludeKeywords || current.excludeKeywords || []); }
@@ -186,6 +192,7 @@ app.put('/api/sources/:id', async (req, res, next) => {
     if (updates.visualMatchEnabled === true && !current.visualMatchEnabled) updates.geminiLastScannedVideoId = '';
     if (updates.visualMatchAction && updates.visualMatchAction !== current.visualMatchAction) updates.geminiLastScannedVideoId = '';
     if (updates.adaptiveDiscoveryEnabled === true && !current.adaptiveDiscoveryEnabled) updates.adaptiveLastRunAt = null;
+    if (updates.dailyTopVideosEnabled === true) updates.adaptiveLastRunAt = null;
     const source = await Source.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true, runValidators: true });
     res.json(source);
   } catch (e) { next(e); }

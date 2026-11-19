@@ -16,6 +16,8 @@ const sourceSchema = new Schema({
   videosPerScan: { type: Number, default: defaultVideosPerScan, min: 1, max: 10000 },
   adaptiveDiscoveryEnabled: { type: Boolean, default: false },
   trendingDiscoveryEnabled: { type: Boolean, default: false },
+  dailyTopVideosEnabled: { type: Boolean, default: false },
+  dailyTopVideosCount: { type: Number, default: 1, min: 1, max: 10 },
   adaptiveContentType: { type: String, enum: ['BOTH', 'VIDEOS', 'SHORTS'], default: 'BOTH' },
   adaptiveLastRunAt: { type: Date, default: null },
   scanDescription: { type: Boolean, default: true },
