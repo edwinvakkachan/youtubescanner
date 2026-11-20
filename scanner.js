@@ -14,6 +14,8 @@ const { computeProfile, rankVideos, median } = require('./adaptive-analytics');
 
 const LIMIT = Math.min(10000, Math.max(1, Number.parseInt(process.env.VIDEOS_PER_SOURCE || '50', 10) || 50));
 const MAX_RETRIES = Math.max(1, Number.parseInt(process.env.MAX_RETRIES || '3', 10) || 3);
+const YT_DLP_TIMEOUT_MINUTES = Math.min(180, Math.max(5, Number.parseInt(process.env.YT_DLP_TIMEOUT_MINUTES || '20', 10) || 20));
+const YT_DLP_TIMEOUT_MS = YT_DLP_TIMEOUT_MINUTES * 60 * 1000;
 const PRIORITY_RANK = { HIGH: 1, NORMAL: 2, LOW: 3 };
 const keywordRegexCache = new WeakMap();
 let activeAll = false;
@@ -22,11 +24,11 @@ const activeSources = new Set();
 function runYtDlp(source, limit) {
   return new Promise((resolve, reject) => {
     const executable = process.env.YT_DLP_PATH || 'yt-dlp';
-    const args = ['--dump-json', '--playlist-end', String(limit), '--ignore-errors', '--no-warnings', '--skip-download', source.url];
+    const args = ['--dump-json', '--playlist-end', String(limit), '--retries', '3', '--extractor-retries', '3', '--socket-timeout', '30', '--ignore-errors', '--no-warnings', '--skip-download', source.url];
     const child = spawn(executable, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     const entries = [];
-    let stderr = ''; let settled = false; let parseErrors = 0;
-    const timeout = setTimeout(() => { child.kill(); if (!settled) { settled = true; clearInterval(heartbeat); reject(new Error('yt-dlp timed out after 5 minutes')); } }, 300000);
+    let stderr = ''; let settled = false; let parseErrors = 0; let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; logger.warn('ytdlp_process_timeout', { sourceId: String(source._id), sourceName: source.name, timeoutMinutes: YT_DLP_TIMEOUT_MINUTES, metadataEntriesReceived: entries.length }); child.kill(); }, YT_DLP_TIMEOUT_MS);
     const heartbeat = setInterval(() => logger.info('ytdlp_process_still_running', { sourceId: String(source._id), sourceName: source.name, elapsedSeconds: Math.floor((Date.now() - startedAt) / 1000), metadataEntriesReceived: entries.length, targetEntries: limit }), 30000);
     const startedAt = Date.now();
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
@@ -49,6 +51,7 @@ function runYtDlp(source, limit) {
       clearTimeout(timeout); clearInterval(heartbeat);
       if (settled) return;
       settled = true;
+      if (timedOut) return reject(new Error(`yt-dlp timed out after ${YT_DLP_TIMEOUT_MINUTES} minutes`));
       if (code !== 0 && entries.length) logger.warn('ytdlp_partial_exit', { sourceId: String(source._id), sourceName: source.name, exitCode: code, metadataEntriesReceived: entries.length, stderr: stderr.trim().slice(-2000) });
       if (code !== 0 && !entries.length) return reject(new Error((stderr.trim() || `yt-dlp exited ${code}`).slice(-2000)));
       logger.info('ytdlp_process_finished', { sourceId: String(source._id), sourceName: source.name, exitCode: code, metadataEntriesReceived: entries.length, invalidLines: parseErrors, durationMs: Date.now() - startedAt });
@@ -73,12 +76,13 @@ function runAdaptiveFeed(source, url, contentType, target, cutoffDate) {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     const executable = process.env.YT_DLP_PATH || 'yt-dlp';
-    const args = ['--dump-json', '--lazy-playlist'];
+    const args = ['--dump-json', '--lazy-playlist', '--retries', '3', '--extractor-retries', '3', '--socket-timeout', '30'];
     if (cutoffDate) args.push('--dateafter', cutoffDate.toISOString().slice(0, 10).replace(/-/g, ''));
     args.push('--ignore-errors', '--no-warnings', '--skip-download', url);
     const child = spawn(executable, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    const entries = []; let stderr = ''; let settled = false; let stopReason = '';
-    const timeout = setTimeout(() => { child.kill(); if (!settled) { settled = true; reject(new Error('Adaptive yt-dlp discovery timed out after 5 minutes')); } }, 300000);
+    const entries = []; let stderr = ''; let settled = false; let stopReason = ''; let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; logger.warn('adaptive_ytdlp_feed_timeout', { sourceId: String(source._id), sourceName: source.name, contentType, timeoutMinutes: YT_DLP_TIMEOUT_MINUTES, candidates: entries.length, stderr: stderr.trim().slice(-1000) }); child.kill(); }, YT_DLP_TIMEOUT_MS);
+    const heartbeat = setInterval(() => logger.info('adaptive_ytdlp_feed_still_running', { sourceId: String(source._id), sourceName: source.name, contentType, elapsedSeconds: Math.floor((Date.now() - startedAt) / 1000), candidates: entries.length, target }), 30000);
     const outputLines = readline.createInterface({ input: child.stdout });
     outputLines.on('line', line => {
       if (!line.trim() || stopReason) return;
@@ -97,9 +101,10 @@ function runAdaptiveFeed(source, url, contentType, target, cutoffDate) {
       }
     });
     child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-4000); });
-    child.on('error', error => { if (!settled) { settled = true; clearTimeout(timeout); reject(error); } });
+    child.on('error', error => { if (!settled) { settled = true; clearTimeout(timeout); clearInterval(heartbeat); reject(error); } });
     child.on('close', code => {
-      clearTimeout(timeout); if (settled) return; settled = true;
+      clearTimeout(timeout); clearInterval(heartbeat); if (settled) return; settled = true;
+      if (timedOut) return reject(new Error(`Adaptive yt-dlp discovery timed out after ${YT_DLP_TIMEOUT_MINUTES} minutes`));
       if (code !== 0 && !entries.length && !stopReason) return reject(new Error((stderr.trim() || `yt-dlp exited ${code}`).slice(-2000)));
       logger.info('adaptive_ytdlp_feed_finished', { sourceId: String(source._id), sourceName: source.name, contentType, exitCode: code, stopReason: stopReason || 'feed-exhausted', metadataEntriesReceived: entries.length, durationMs: Date.now() - startedAt });
       resolve(entries);

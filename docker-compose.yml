@@ -8,6 +8,7 @@ services:
       PORT: ${PORT:-3000}
       MONGODB_URI: ${MONGODB_URI:?Set MONGODB_URI in the Compose or Portainer stack environment}
       YT_DLP_PATH: /opt/yt-dlp/bin/yt-dlp
+      YT_DLP_TIMEOUT_MINUTES: ${YT_DLP_TIMEOUT_MINUTES:-20}
       LOG_LEVEL: ${LOG_LEVEL:-debug}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       IMAGEKIT_PRIVATE_KEY: ${IMAGEKIT_PRIVATE_KEY:-}
