@@ -40,6 +40,7 @@ const sourceSchema = new Schema({
   autoApproveVideos: { type: Boolean, default: false },
   enabled: { type: Boolean, default: true },
   lastScannedAt: { type: Date, default: null },
+  scanCursorVideoId: { type: String, default: '' },
   scanLockUntil: { type: Date, default: null, select: false },
   scanLockToken: { type: String, default: null, select: false }
 }, { timestamps: true });

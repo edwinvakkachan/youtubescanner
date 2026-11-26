@@ -607,7 +607,19 @@ async function scanSource(source, { forceAdaptive = false } = {}) {
       logger.info('source_scan_completed', { sourceId: sourceKey, sourceName: source.name, mode, status: errors.length ? 'PARTIAL' : 'COMPLETED', inspected, matched, rejected, errors: errors.length, durationMs: completedAt.getTime() - startedAt.getTime() });
       return { sourceId: sourceKey, inspected, matched, rejected, errors: errors.length, mode, queued: adaptiveResult.queued, geminiAttempted: adaptiveResult.geminiAttempted };
     }
-    const entries = await runYtDlp(source, limit);
+    // Fetch enough of the feed to find the saved boundary. yt-dlp returns channel
+    // uploads newest first, so continuing after the cursor walks toward older uploads.
+    const feed = await runYtDlp(source, source.scanCursorVideoId ? 10000 : limit);
+    const cursorIndex = source.scanCursorVideoId ? feed.findIndex(entry => videoId(entry) === source.scanCursorVideoId) : -1;
+    let entries = cursorIndex >= 0 ? feed.slice(cursorIndex + 1, cursorIndex + 1 + limit) : feed.slice(0, limit);
+    // Once the older backlog is exhausted, only revisit uploads newer than the
+    // cursor if they are genuinely new to this source.
+    if (cursorIndex >= 0 && entries.length === 0 && cursorIndex > 0) {
+      const newer = feed.slice(0, cursorIndex);
+      const alreadyScanned = await ScannedVideoHistory.distinct('youtubeId', { sourceId: source._id, youtubeId: { $in: newer.map(videoId).filter(Boolean) } });
+      const seen = new Set(alreadyScanned);
+      entries = newer.filter(entry => !seen.has(videoId(entry))).slice(0, limit);
+    }
     let geminiResults = { results: new Map(), skippedIds: new Set(), attempted: 0, error: null };
     if (source.thumbnailGeminiEnabled === true || source.visualMatchEnabled === true) {
       geminiResults = await scanNewGeminiThumbnails(source, entries.slice(0, limit));
@@ -655,7 +667,8 @@ async function scanSource(source, { forceAdaptive = false } = {}) {
     }
     const completedAt = new Date();
     if (scannedVideos.length) { await ScannedVideoHistory.insertMany(scannedVideos, { ordered: false }); scannedVideosSaved = true; }
-    await Source.updateOne({ _id: source._id }, { $set: { lastScannedAt: completedAt } });
+    const lastEntryId = entries.length ? videoId(entries.at(-1)) : '';
+    await Source.updateOne({ _id: source._id }, { $set: { lastScannedAt: completedAt, ...(lastEntryId ? { scanCursorVideoId: lastEntryId } : {}) } });
     await ScanHistory.updateOne({ _id: history._id }, { $set: { completedAt, inspected, matched, rejected, errorCount: errors.length, errorDetails: errors, status: errors.length ? (inspected ? 'PARTIAL' : 'FAILED') : 'COMPLETED' } });
     logger.info('source_scan_completed', { sourceId: sourceKey, sourceName: source.name, status: errors.length ? (inspected ? 'PARTIAL' : 'FAILED') : 'COMPLETED', inspected, matched, rejected, thumbnailGeminiAttempted: geminiAttempted, thumbnailGeminiSkipped: geminiResults.skippedIds.size, geminiLastScannedVideoId: source.geminiLastScannedVideoId || null, errors: errors.length, durationMs: completedAt.getTime() - startedAt.getTime() });
     return { sourceId: sourceKey, inspected, matched, rejected, errors: errors.length };
