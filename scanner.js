@@ -611,14 +611,19 @@ async function scanSource(source, { forceAdaptive = false } = {}) {
     // uploads newest first, so continuing after the cursor walks toward older uploads.
     const feed = await runYtDlp(source, source.scanCursorVideoId ? 10000 : limit);
     const cursorIndex = source.scanCursorVideoId ? feed.findIndex(entry => videoId(entry) === source.scanCursorVideoId) : -1;
-    let entries = cursorIndex >= 0 ? feed.slice(cursorIndex + 1, cursorIndex + 1 + limit) : feed.slice(0, limit);
-    // Once the older backlog is exhausted, only revisit uploads newer than the
-    // cursor if they are genuinely new to this source.
-    if (cursorIndex >= 0 && entries.length === 0 && cursorIndex > 0) {
+    let entries;
+    if (cursorIndex >= 0) {
       const newer = feed.slice(0, cursorIndex);
-      const alreadyScanned = await ScannedVideoHistory.distinct('youtubeId', { sourceId: source._id, youtubeId: { $in: newer.map(videoId).filter(Boolean) } });
+      const alreadyScanned = newer.length
+        ? await ScannedVideoHistory.distinct('youtubeId', { sourceId: source._id, youtubeId: { $in: newer.map(videoId).filter(Boolean) } })
+        : [];
       const seen = new Set(alreadyScanned);
-      entries = newer.filter(entry => !seen.has(videoId(entry))).slice(0, limit);
+      // Process any uploads added since the previous scan first. If they use
+      // only part of the batch, continue through the older backlog afterward.
+      const freshUploads = newer.filter(entry => !seen.has(videoId(entry)));
+      entries = [...freshUploads, ...feed.slice(cursorIndex + 1)].slice(0, limit);
+    } else {
+      entries = feed.slice(0, limit);
     }
     let geminiResults = { results: new Map(), skippedIds: new Set(), attempted: 0, error: null };
     if (source.thumbnailGeminiEnabled === true || source.visualMatchEnabled === true) {
