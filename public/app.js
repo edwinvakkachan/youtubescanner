@@ -1,6 +1,6 @@
 'use strict';
 const $ = s => document.querySelector(s);
-const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', sourceSearch: '', sourceSearchRegex: false, approvalChannelId: '', timer: null, sorts: {}, trendingFilters: { sourceId: '', contentType: '', importStatus: '', sort: 'viewVelocityPerDay:desc' } };
+const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', sourceSearch: '', sourceSearchRegex: false, approvalChannelId: '', sourceHistoryId: '', sourceDecision: '', timer: null, sorts: {}, trendingFilters: { sourceId: '', contentType: '', importStatus: '', sort: 'viewVelocityPerDay:desc' } };
 let visualPreviewUrls = [];
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
 function applyTheme(theme, persist = true) {
@@ -100,7 +100,7 @@ async function renderSources() {
   const sources = await api('/api/sources');
   const tabs = `<div class="toolbar"><label class="source-search">Search sources<input id="sourceSearch" type="search" placeholder="Channel/source name or regex" value="${escapeHtml(state.sourceSearch)}"></label><label class="source-regex-toggle"><input id="sourceSearchRegex" type="checkbox" ${state.sourceSearchRegex ? 'checked' : ''}> Regex</label>${['channel', 'playlist', 'shorts'].map(t => `<button class="smallbtn ${state.sourceType === t ? 'active' : ''}" data-type="${t}">${t[0].toUpperCase() + t.slice(1)} (${sources.filter(s => s.type === t).length})</button>`).join('')}<button class="button primary" id="addSource">+ Add source</button></div><p class="sub regex-search-error" id="sourceSearchError" hidden></p>`;
   const shown = sources.filter(s => s.type === state.sourceType);
-  const cards = shown.length ? `<div class="source-grid">${shown.map(s => `<article class="source-card" data-source-name="${escapeHtml(s.name.normalize('NFC').toLocaleLowerCase())}" data-source-url="${escapeHtml(s.url.normalize('NFC').toLocaleLowerCase())}"><div class="source-title"><div><h3>${escapeHtml(s.name)}</h3><div class="source-url" title="${escapeHtml(s.url)}">${escapeHtml(s.url)}</div></div>${badge(s.enabled ? 'ENABLED' : 'DISABLED')}</div><div class="tagrow">${badge(s.priority)}<span class="tag">${escapeHtml(s.matchMode)} match</span><span class="tag">${s.videosPerScan || 50} videos/scan</span>${s.adaptiveDiscoveryEnabled ? '<span class="tag">Adaptive Top 10</span>' : ''}${s.trendingDiscoveryEnabled ? '<span class="tag">Trending</span>' : ''}<span class="tag">Description ${s.scanDescription === false && !s.generateNfo ? 'off' : 'on'}</span>${s.generateNfo ? '<span class="tag">NFO enabled</span>' : ''}${s.thumbnailGeminiEnabled ? '<span class="tag">Gemini thumbnail analysis enabled</span>' : ''}${(s.keywords || []).map(k => `<span class="tag">${escapeHtml(k)}</span>`).join('')}${(s.excludeKeywords || []).map(k => `<span class="tag">− ${escapeHtml(k)}</span>`).join('')}</div><div class="cardfoot"><small>Last scan: ${s.lastScannedAt ? new Date(s.lastScannedAt).toLocaleString() : 'Never scanned'}</small><div class="actions"><button class="smallbtn" data-act="scan-source" data-id="${s._id}">Scan</button>${s.adaptiveDiscoveryEnabled ? `<button class="smallbtn" data-act="adaptive-rankings" data-id="${s._id}">Top 10</button>` : ''}<button class="smallbtn" data-act="toggle-gemini" data-id="${s._id}">${s.thumbnailGeminiEnabled ? 'Disable Gemini' : 'Enable Gemini'}</button><button class="smallbtn" data-act="edit-source" data-id="${s._id}">Edit</button><button class="smallbtn" data-act="toggle-source" data-id="${s._id}">${s.enabled ? 'Disable' : 'Enable'}</button><button class="smallbtn" data-act="delete-source" data-id="${s._id}">Delete</button></div></div></article>`).join('')}</div><div id="sourceSearchEmpty" class="empty" hidden><strong>No matching sources</strong>Try another source name.</div>` : '<div class="empty"><strong>No sources configured</strong>Add a YouTube channel, playlist, or Shorts source to start discovering videos.</div>';
+  const cards = shown.length ? `<div class="source-grid">${shown.map(s => `<article class="source-card" data-source-name="${escapeHtml(s.name.normalize('NFC').toLocaleLowerCase())}" data-source-url="${escapeHtml(s.url.normalize('NFC').toLocaleLowerCase())}"><div class="source-title"><div><h3>${escapeHtml(s.name)}</h3><div class="source-url" title="${escapeHtml(s.url)}">${escapeHtml(s.url)}</div></div>${badge(s.enabled ? 'ENABLED' : 'DISABLED')}</div><div class="tagrow">${badge(s.priority)}<span class="tag">${escapeHtml(s.matchMode)} match</span><span class="tag">${s.videosPerScan || 50} videos/scan</span>${s.adaptiveDiscoveryEnabled ? '<span class="tag">Adaptive Top 10</span>' : ''}${s.trendingDiscoveryEnabled ? '<span class="tag">Trending</span>' : ''}<span class="tag">Description ${s.scanDescription === false && !s.generateNfo ? 'off' : 'on'}</span>${s.generateNfo ? '<span class="tag">NFO enabled</span>' : ''}${s.thumbnailGeminiEnabled ? '<span class="tag">Gemini thumbnail analysis enabled</span>' : ''}${(s.keywords || []).map(k => `<span class="tag">${escapeHtml(k)}</span>`).join('')}${(s.excludeKeywords || []).map(k => `<span class="tag">− ${escapeHtml(k)}</span>`).join('')}</div><div class="cardfoot"><small>Last scan: ${s.lastScannedAt ? new Date(s.lastScannedAt).toLocaleString() : 'Never scanned'}</small><div class="actions"><button class="smallbtn" data-act="source-history" data-id="${s._id}">History</button><button class="smallbtn" data-act="scan-source" data-id="${s._id}">Scan</button>${s.adaptiveDiscoveryEnabled ? `<button class="smallbtn" data-act="adaptive-rankings" data-id="${s._id}">Top 10</button>` : ''}<button class="smallbtn" data-act="toggle-gemini" data-id="${s._id}">${s.thumbnailGeminiEnabled ? 'Disable Gemini' : 'Enable Gemini'}</button><button class="smallbtn" data-act="edit-source" data-id="${s._id}">Edit</button><button class="smallbtn" data-act="toggle-source" data-id="${s._id}">${s.enabled ? 'Disable' : 'Enable'}</button><button class="smallbtn" data-act="delete-source" data-id="${s._id}">Delete</button></div></div></article>`).join('')}</div><div id="sourceSearchEmpty" class="empty" hidden><strong>No matching sources</strong>Try another source name.</div>` : '<div class="empty"><strong>No sources configured</strong>Add a YouTube channel, playlist, or Shorts source to start discovering videos.</div>';
   $('#content').innerHTML = `${shell('Manage sources', 'Configure YouTube sources and their discovery rules', tabs)}${cards}</div>`;
 }
 function adaptiveRankingTable(title, rows) {
@@ -171,6 +171,18 @@ async function renderHistory() {
   const body = d.items.length ? `<div class="tablewrap"><table><thead><tr><th>Source</th><th>Status</th><th>Started</th><th>Completed</th><th>Inspected</th><th>Matched</th><th>Rejected</th><th>Errors</th></tr></thead><tbody>${d.items.map(x => `<tr><td><b>${escapeHtml(x.sourceName)}</b><div class="sub">${escapeHtml(x.sourceType)}</div></td><td>${badge(x.status)}</td><td>${x.startedAt ? new Date(x.startedAt).toLocaleString() : '—'}</td><td>${x.completedAt ? new Date(x.completedAt).toLocaleString() : '—'}</td><td>${x.inspected}</td><td>${x.matched}</td><td>${x.rejected}</td><td>${x.errorCount ?? x.errors ?? 0}${x.errorDetails?.length ? `<div class="sub historydetails" title="${escapeHtml(x.errorDetails.join('\n'))}">${escapeHtml(x.errorDetails[0])}</div>` : ''}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No scans have run.</div>';
   $('#content').innerHTML = `${shell('Scan history', 'Recorded source scans and extraction errors', sortControl(historySorts, 'startedAt:desc'))}${body}${paging(d)}</div>`;
 }
+async function renderSourceHistory() {
+  const sourceId = state.sourceHistoryId;
+  const [sources, scans] = await Promise.all([api('/api/sources'), api(`/api/scan-history/${encodeURIComponent(sourceId)}`)]);
+  const source = sources.find(s => s._id === sourceId);
+  const name = source?.name || scans[0]?.sourceName || 'Deleted source';
+  const qs = new URLSearchParams({ page: String(state.page), limit: String(state.limit), sort: 'discoveredAt', order: 'desc', sourceId });
+  if (state.sourceDecision) qs.set('approvalStatus', state.sourceDecision);
+  const videos = await api(`/api/queue?${qs}`);
+  const scansTable = scans.length ? `<div class="tablewrap"><table><thead><tr><th>Scan</th><th>Status</th><th>Inspected</th><th>Matched</th><th>Rejected</th><th>Errors</th></tr></thead><tbody>${scans.map(x => `<tr><td>${x.startedAt ? new Date(x.startedAt).toLocaleString() : '—'}</td><td>${badge(x.status)}</td><td>${x.inspected ?? 0}</td><td>${x.matched ?? 0}</td><td>${x.rejected ?? 0}</td><td>${x.errorCount ?? 0}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No scan records for this source.</div>';
+  const decision = `<label class="source-filter">Decision <select id="sourceDecisionFilter"><option value="">All decisions</option>${['APPROVED','REJECTED','PENDING'].map(v => `<option value="${v}" ${state.sourceDecision === v ? 'selected' : ''}>${v === 'PENDING' ? 'Pending review' : v}</option>`).join('')}</select></label>`;
+  $('#content').innerHTML = `${shell(`${escapeHtml(name)} history`, 'Scans and discovered videos with their current approval decisions', '<button class="button" id="backToSources">Back to sources</button>')}<h3 class="history-section-title">Scans</h3>${scansTable}<div class="panelhead source-history-videos"><div><h3>Scanned videos</h3><p>Approval status reflects the current decision</p></div>${decision}</div>${videoRows(videos.items, 'none')}${paging(videos)}</div>`;
+}
 async function render() {
   state.page = Math.max(1, state.page);
   $('#nav').querySelectorAll('.navitem').forEach(b => b.classList.toggle('active', b.dataset.view === state.view));
@@ -180,6 +192,7 @@ async function render() {
   if (state.view === 'trending') return renderTrending();
   if (state.view === 'keywords') return renderKeywords();
   if (state.view === 'history') return renderHistory();
+  if (state.view === 'source-history') return renderSourceHistory();
   return renderQueue(state.view);
 }
 function showSource(source = null) {
@@ -314,6 +327,7 @@ $('#content').addEventListener('click', async e => {
   const btn = e.target.closest('[data-act]'); if (!btn) return;
   try {
     const id = btn.dataset.id;
+    if (btn.dataset.act === 'source-history') { state.sourceHistoryId = id; state.sourceDecision = ''; state.page = 1; state.view = 'source-history'; return render().catch(err => toast(err.message, true)); }
     if (btn.dataset.act === 'adaptive-rankings') return await renderAdaptiveRankings(id);
     if (btn.dataset.act === 'approve' || btn.dataset.act === 'reject') { await api(`/api/queue/${id}/${btn.dataset.act}`, { method: 'POST' }); toast(`Video ${btn.dataset.act}d`); }
     if (btn.dataset.act === 'retry') { await api(`/api/queue/${id}/retry`, { method: 'POST' }); toast('Video returned to pending imports'); }
@@ -358,6 +372,7 @@ $('#content').addEventListener('change', e => {
   }
 });
 $('#content').addEventListener('change', e => { if (e.target.id !== 'approvalChannelFilter') return; state.approvalChannelId = e.target.value; state.page = 1; render().catch(err => toast(err.message, true)); });
+$('#content').addEventListener('change', e => { if (e.target.id !== 'sourceDecisionFilter') return; state.sourceDecision = e.target.value; state.page = 1; renderSourceHistory().catch(err => toast(err.message, true)); });
 $('#content').addEventListener('change', async e => { if (e.target.id === 'keywordSource') { try { const sources = await api('/api/sources'); const source = sources.find(s => s._id === e.target.value); if (source) await fillKeywords(source); } catch (err) { toast(err.message, true); } } });
 $('#sourceForm').addEventListener('submit', async e => {
   e.preventDefault();
