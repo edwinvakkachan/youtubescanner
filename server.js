@@ -3,10 +3,12 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const { connectDB } = require('./db');
-const { Source, QueuedVideo, ScanHistory, ScannerSettings } = require('./models');
+const { Source, QueuedVideo, ScanHistory, ScannedVideoHistory, ScannerSettings, AdaptiveVideo, ChannelProfile, ChannelRanking, VideoStatsHistory } = require('./models');
 const scanner = require('./scanner');
 const scheduler = require('./scheduler');
 const logger = require('./logger');
+const imagekit = require('./imagekit');
+const { validateRegexList } = require('./keyword-search');
 const app = express();
 app.use((req, res, next) => {
   const started = Date.now();
@@ -24,16 +26,18 @@ app.use(express.static('public'));
 const priorities = ['HIGH', 'NORMAL', 'LOW'];
 const types = ['channel', 'playlist', 'shorts'];
 const matchModes = ['ANY', 'ALL'];
+const maxVisualReferences = 10;
+const maxVisualReferenceBytes = 8 * 1024 * 1024;
 const allowedUrl = value => { try { const u = new URL(value); return ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be', 'youtube.com.', 'www.youtube.com.'].includes(u.hostname) || u.hostname.endsWith('.youtube.com'); } catch { return false; } };
 function cleanKeywords(value) {
   if (value === undefined) return undefined;
-  if (!Array.isArray(value) || value.length > 200 || value.some(v => typeof v !== 'string' || !v.trim() || v.length > 120)) throw Object.assign(new Error('Keywords must be an array of non-empty strings (max 120 chars each)'), { status: 400 });
+  if (!Array.isArray(value) || value.length > 200 || value.some(v => typeof v !== 'string' || !v.trim() || v.length > 256)) throw Object.assign(new Error('Keywords must be an array of non-empty strings (max 256 chars each)'), { status: 400 });
   return [...new Set(value.map(v => v.trim()))];
 }
 function sourceInput(body, partial = false) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw Object.assign(new Error('JSON object required'), { status: 400 });
   const out = {};
-  for (const key of ['name', 'url', 'type', 'matchMode', 'priority', 'enabled', 'autoApproveVideos', 'videosPerScan', 'scanDescription', 'generateNfo', 'thumbnailGeminiEnabled', 'keywords', 'excludeKeywords']) {
+  for (const key of ['name', 'url', 'type', 'matchMode', 'priority', 'enabled', 'autoApproveVideos', 'adaptiveDiscoveryEnabled', 'trendingDiscoveryEnabled', 'dailyTopVideosEnabled', 'dailyTopVideosCount', 'adaptiveContentType', 'visualMatchEnabled', 'visualMatchAutoApprove', 'visualMatchAction', 'keywordSearchMode', 'videosPerScan', 'scanDescription', 'generateNfo', 'thumbnailGeminiEnabled', 'keywords', 'excludeKeywords']) {
     if (!(key in body)) continue;
     const value = body[key];
     if (key === 'name') { if (typeof value !== 'string' || !value.trim() || value.length > 160) throw Object.assign(new Error('Name is required (max 160 chars)'), { status: 400 }); out.name = value.trim(); }
@@ -41,14 +45,32 @@ function sourceInput(body, partial = false) {
     else if (key === 'type') { if (!types.includes(value)) throw Object.assign(new Error('Invalid source type'), { status: 400 }); out.type = value; }
     else if (key === 'matchMode') { if (!matchModes.includes(value)) throw Object.assign(new Error('matchMode must be ANY or ALL'), { status: 400 }); out.matchMode = value; }
     else if (key === 'priority') { if (!priorities.includes(value)) throw Object.assign(new Error('Invalid priority'), { status: 400 }); out.priority = value; }
+    else if (key === 'visualMatchAction') { if (!['ACCEPT', 'REJECT'].includes(value)) throw Object.assign(new Error('visualMatchAction must be ACCEPT or REJECT'), { status: 400 }); out[key] = value; }
+    else if (key === 'keywordSearchMode') { if (!['TEXT', 'REGEX'].includes(value)) throw Object.assign(new Error('keywordSearchMode must be TEXT or REGEX'), { status: 400 }); out[key] = value; }
     else if (key === 'enabled') { if (typeof value !== 'boolean') throw Object.assign(new Error('enabled must be boolean'), { status: 400 }); out.enabled = value; }
     else if (key === 'autoApproveVideos') { if (typeof value !== 'boolean') throw Object.assign(new Error('autoApproveVideos must be boolean'), { status: 400 }); out.autoApproveVideos = value; }
+    else if (key === 'adaptiveDiscoveryEnabled') { if (typeof value !== 'boolean') throw Object.assign(new Error('adaptiveDiscoveryEnabled must be boolean'), { status: 400 }); out.adaptiveDiscoveryEnabled = value; }
+    else if (key === 'trendingDiscoveryEnabled') { if (typeof value !== 'boolean') throw Object.assign(new Error('trendingDiscoveryEnabled must be boolean'), { status: 400 }); out.trendingDiscoveryEnabled = value; }
+    else if (key === 'dailyTopVideosEnabled') { if (typeof value !== 'boolean') throw Object.assign(new Error('dailyTopVideosEnabled must be boolean'), { status: 400 }); out.dailyTopVideosEnabled = value; }
+    else if (key === 'dailyTopVideosCount') { if (!Number.isInteger(value) || value < 1 || value > 10) throw Object.assign(new Error('dailyTopVideosCount must be an integer from 1 to 10'), { status: 400 }); out.dailyTopVideosCount = value; }
+    else if (key === 'adaptiveContentType') { if (!['BOTH', 'VIDEOS', 'SHORTS'].includes(value)) throw Object.assign(new Error('adaptiveContentType must be BOTH, VIDEOS, or SHORTS'), { status: 400 }); out.adaptiveContentType = value; }
     else if (key === 'videosPerScan') { if (!Number.isInteger(value) || value < 1 || value > 10000) throw Object.assign(new Error('videosPerScan must be an integer from 1 to 10000'), { status: 400 }); out.videosPerScan = value; }
-    else if (key === 'scanDescription' || key === 'generateNfo' || key === 'thumbnailGeminiEnabled') { if (typeof value !== 'boolean') throw Object.assign(new Error(`${key} must be boolean`), { status: 400 }); out[key] = value; }
+    else if (key === 'scanDescription' || key === 'generateNfo' || key === 'thumbnailGeminiEnabled' || key === 'visualMatchEnabled' || key === 'visualMatchAutoApprove') { if (typeof value !== 'boolean') throw Object.assign(new Error(`${key} must be boolean`), { status: 400 }); out[key] = value; }
     else out[key] = cleanKeywords(value);
   }
   if (out.type && out.type !== 'channel' && out.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 });
+  if (out.type && out.type !== 'channel' && out.adaptiveDiscoveryEnabled) throw Object.assign(new Error('Adaptive Top 10 discovery is only available for channel sources'), { status: 400 });
+  if (out.type && out.type !== 'channel' && out.trendingDiscoveryEnabled) throw Object.assign(new Error('Trending discovery is only available for channel sources'), { status: 400 });
+  if (out.type && out.type !== 'channel' && out.dailyTopVideosEnabled) throw Object.assign(new Error('Daily Top Videos is only available for channel sources'), { status: 400 });
+  if (out.dailyTopVideosEnabled === true) { out.adaptiveDiscoveryEnabled = false; out.trendingDiscoveryEnabled = false; }
+  if (out.trendingDiscoveryEnabled === true) out.adaptiveDiscoveryEnabled = false;
+  if (out.adaptiveDiscoveryEnabled === true) out.trendingDiscoveryEnabled = false;
+  if (out.trendingDiscoveryEnabled === true || out.adaptiveDiscoveryEnabled === true) out.dailyTopVideosEnabled = false;
   if (out.type && out.type !== 'channel' && out.autoApproveVideos === undefined) out.autoApproveVideos = false;
+  if (out.keywordSearchMode === 'REGEX') {
+    try { validateRegexList(out.keywords || []); validateRegexList(out.excludeKeywords || []); }
+    catch (err) { throw Object.assign(err, { status: 400 }); }
+  }
   if (!partial && (!out.name || !out.url || !out.type)) throw Object.assign(new Error('name, url and type are required'), { status: 400 });
   return out;
 }
@@ -67,9 +89,200 @@ function requestedSort(req, allowed, fallback) {
 }
 app.get('/api/health', (_req, res) => res.json({ ok: true, database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 app.get('/api/sources', async (_req, res, next) => { try { res.json(await Source.find().sort({ type: 1, name: 1 }).lean()); } catch (e) { next(e); } });
-app.post('/api/sources', async (req, res, next) => { try { res.status(201).json(await Source.create(sourceInput(req.body))); } catch (e) { next(e); } });
-app.put('/api/sources/:id', async (req, res, next) => { try { objectId(req.params.id); const updates = sourceInput(req.body, true); const current = await Source.findById(req.params.id).select('type'); if (!current) return res.status(404).json({ error: 'Source not found' }); if ((updates.type || current.type) !== 'channel' && updates.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 }); const source = await Source.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true, runValidators: true }); res.json(source); } catch (e) { next(e); } });
-app.delete('/api/sources/:id', async (req, res, next) => { try { objectId(req.params.id); const source = await Source.findByIdAndDelete(req.params.id); if (!source) return res.status(404).json({ error: 'Source not found' }); res.json({ deleted: true }); } catch (e) { next(e); } });
+app.post('/api/sources', async (req, res, next) => {
+  try {
+    const input = sourceInput(req.body);
+    if (input.visualMatchEnabled) throw Object.assign(new Error('Save the source and upload its reference image before enabling visual matching'), { status: 400 });
+    res.status(201).json(await Source.create(input));
+  } catch (e) { next(e); }
+});
+app.put('/api/sources/:id/visual-reference', express.raw({ type: ['image/jpeg', 'image/png', 'image/webp'], limit: '8mb' }), async (req, res, next) => {
+  const uploads = [];
+  let persisted = false;
+  try {
+    objectId(req.params.id);
+    if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(415).json({ error: 'Upload a JPEG, PNG, or WebP reference image' });
+    const mimeType = String(req.headers['content-type'] || '').split(';')[0].toLowerCase();
+    const current = await Source.findById(req.params.id).select('visualReferences visualReferenceMimeType +visualReferenceFileId +visualReferenceUrl +visualReferenceImage');
+    if (!current) return res.status(404).json({ error: 'Source not found' });
+    const references = (current.visualReferences || []).map(ref => ({ _id: ref._id, fileId: ref.fileId, url: ref.url, mimeType: ref.mimeType, bytes: ref.bytes || 0 }));
+    if (!references.length && current.visualReferenceFileId && current.visualReferenceUrl) {
+      const legacyImage = await imagekit.downloadReferenceImage(current.visualReferenceUrl);
+      references.push({ fileId: current.visualReferenceFileId, url: current.visualReferenceUrl, mimeType: legacyImage.mimeType, bytes: legacyImage.image.length });
+    }
+    if (!references.length && current.visualReferenceImage?.length && current.visualReferenceMimeType) {
+      const legacy = Buffer.from(current.visualReferenceImage);
+      const migrated = await imagekit.uploadReferenceImage({ image: legacy, mimeType: current.visualReferenceMimeType, sourceId: req.params.id });
+      uploads.push(migrated.fileId);
+      references.push({ ...migrated, bytes: legacy.length });
+      logger.info('visual_reference_image_migrated_to_imagekit', { sourceId: req.params.id, sourceName: current.name, provider: 'imagekit', fileId: migrated.fileId, mimeType: current.visualReferenceMimeType, bytes: legacy.length });
+    }
+    if (references.length >= maxVisualReferences) return res.status(400).json({ error: `A source can have up to ${maxVisualReferences} reference images` });
+    const knownBytes = references.reduce((sum, ref) => sum + (ref.bytes || 0), 0);
+    if (knownBytes + req.body.length > maxVisualReferenceBytes) throw Object.assign(new Error('Reference images for a source must total 8 MB or less'), { status: 413 });
+    const uploaded = await imagekit.uploadReferenceImage({ image: req.body, mimeType, sourceId: req.params.id });
+    uploads.push(uploaded.fileId);
+    references.push({ ...uploaded, bytes: req.body.length });
+    const source = await Source.findByIdAndUpdate(req.params.id, {
+      $set: { visualReferences: references, visualReferenceMimeType: references[0]?.mimeType || mimeType, geminiLastScannedVideoId: '' },
+      $unset: { visualReferenceImage: 1, visualReferenceFileId: 1, visualReferenceUrl: 1 }
+    }, { new: true }).select('visualReferences visualReferenceMimeType visualMatchEnabled');
+    if (!source) throw Object.assign(new Error('Source was removed before its reference image could be saved'), { status: 404 });
+    persisted = true;
+    if (source.visualReferences.length !== references.length) throw new Error('ImageKit reference list was not saved completely in MongoDB');
+    logger.info('visual_reference_image_saved', { sourceId: req.params.id, sourceName: source.name, provider: 'imagekit', fileId: uploaded.fileId, mimeType, bytes: req.body.length, referenceCount: source.visualReferences.length });
+    res.json({ visualReferenceMimeType: source.visualReferenceMimeType, visualMatchEnabled: source.visualMatchEnabled, visualReferences: source.visualReferences, provider: 'imagekit' });
+  } catch (e) {
+    if (!persisted) for (const fileId of uploads) await imagekit.deleteFile(fileId).catch(err => logger.warn('visual_reference_image_upload_cleanup_failed', { sourceId: req.params.id, fileId, message: err.message }));
+    logger.error('visual_reference_image_save_failed', { sourceId: req.params.id, provider: 'imagekit', message: e.message });
+    next(e);
+  }
+});
+app.delete('/api/sources/:id/visual-references/:referenceId', async (req, res, next) => {
+  try {
+    objectId(req.params.id);
+    const current = await Source.findById(req.params.id).select('visualReferences');
+    if (!current) return res.status(404).json({ error: 'Source not found' });
+    const reference = current.visualReferences.id(req.params.referenceId);
+    if (!reference) return res.status(404).json({ error: 'Reference image not found' });
+    const fileId = reference.fileId;
+    reference.deleteOne();
+    current.visualReferenceMimeType = current.visualReferences[0]?.mimeType || '';
+    current.geminiLastScannedVideoId = '';
+    if (!current.visualReferences.length) current.visualMatchEnabled = false;
+    await current.save();
+    try { await imagekit.deleteFile(fileId); }
+    catch (err) { logger.warn('visual_reference_image_delete_failed', { sourceId: req.params.id, sourceName: current.name, provider: 'imagekit', fileId, message: err.message }); }
+    logger.info('visual_reference_image_removed', { sourceId: req.params.id, sourceName: current.name, provider: 'imagekit', fileId, referenceCount: current.visualReferences.length });
+    res.json({ visualReferenceMimeType: current.visualReferenceMimeType, visualMatchEnabled: current.visualMatchEnabled, visualReferences: current.visualReferences });
+  } catch (e) { next(e); }
+});
+app.delete('/api/sources/:id/visual-reference', async (req, res, next) => {
+  try {
+    objectId(req.params.id);
+    const current = await Source.findById(req.params.id).select('visualReferences +visualReferenceFileId');
+    if (!current) return res.status(404).json({ error: 'Source not found' });
+    const fileIds = [...(current.visualReferences || []).map(ref => ref.fileId), current.visualReferenceFileId].filter(Boolean);
+    await Source.findByIdAndUpdate(req.params.id, {
+      $set: { visualReferences: [], visualReferenceMimeType: '', visualMatchEnabled: false, geminiLastScannedVideoId: '' },
+      $unset: { visualReferenceImage: 1, visualReferenceFileId: 1, visualReferenceUrl: 1 }
+    });
+    for (const fileId of fileIds) {
+      try { await imagekit.deleteFile(fileId); }
+      catch (err) { logger.warn('visual_reference_image_delete_failed', { sourceId: req.params.id, sourceName: current.name, provider: 'imagekit', fileId, message: err.message }); }
+    }
+    logger.info('visual_reference_image_removed', { sourceId: req.params.id, sourceName: current.name, provider: fileIds.length ? 'imagekit' : 'legacy_or_empty', referenceCount: 0 });
+    res.json({ visualReferenceMimeType: '', visualMatchEnabled: false, visualReferences: [] });
+  } catch (e) { next(e); }
+});
+app.put('/api/sources/:id', async (req, res, next) => {
+  try {
+    objectId(req.params.id);
+    const updates = sourceInput(req.body, true);
+    const current = await Source.findById(req.params.id).select('type adaptiveDiscoveryEnabled dailyTopVideosEnabled visualReferences visualReferenceMimeType visualMatchEnabled visualMatchAction keywordSearchMode keywords excludeKeywords');
+    if (!current) return res.status(404).json({ error: 'Source not found' });
+    if ((updates.type || current.type) !== 'channel' && updates.autoApproveVideos) throw Object.assign(new Error('Automatic video approval is only available for channel sources'), { status: 400 });
+    if ((updates.type || current.type) !== 'channel' && (updates.adaptiveDiscoveryEnabled ?? current.adaptiveDiscoveryEnabled)) throw Object.assign(new Error('Adaptive Top 10 discovery is only available for channel sources'), { status: 400 });
+    if ((updates.type || current.type) !== 'channel' && (updates.dailyTopVideosEnabled ?? current.dailyTopVideosEnabled)) throw Object.assign(new Error('Daily Top Videos is only available for channel sources'), { status: 400 });
+    if (updates.visualMatchEnabled === true && !current.visualReferences.length && !current.visualReferenceMimeType) throw Object.assign(new Error('Upload a reference image before enabling visual matching'), { status: 400 });
+    if ((updates.keywordSearchMode || current.keywordSearchMode) === 'REGEX') {
+      try { validateRegexList(updates.keywords || current.keywords || []); validateRegexList(updates.excludeKeywords || current.excludeKeywords || []); }
+      catch (err) { throw Object.assign(err, { status: 400 }); }
+    }
+    if (updates.visualMatchEnabled === true && !current.visualMatchEnabled) updates.geminiLastScannedVideoId = '';
+    if (updates.visualMatchAction && updates.visualMatchAction !== current.visualMatchAction) updates.geminiLastScannedVideoId = '';
+    if (updates.adaptiveDiscoveryEnabled === true && !current.adaptiveDiscoveryEnabled) updates.adaptiveLastRunAt = null;
+    if (updates.dailyTopVideosEnabled === true) updates.adaptiveLastRunAt = null;
+    const source = await Source.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true, runValidators: true });
+    res.json(source);
+  } catch (e) { next(e); }
+});
+app.get('/api/adaptive/:sourceId', async (req, res, next) => {
+  try {
+    objectId(req.params.sourceId);
+    const source = await Source.findById(req.params.sourceId).select('name type adaptiveDiscoveryEnabled adaptiveLastRunAt').lean();
+    if (!source) return res.status(404).json({ error: 'Source not found' });
+    if (!source.adaptiveDiscoveryEnabled) return res.status(409).json({ error: 'Adaptive discovery is not enabled for this source' });
+    const [profile, recent, engagement] = await Promise.all([
+      ChannelProfile.findOne({ sourceId: source._id }).lean(),
+      ChannelRanking.findOne({ sourceId: source._id, rankingType: 'recent' }).sort({ rankingDate: -1 }).lean(),
+      ChannelRanking.findOne({ sourceId: source._id, rankingType: 'engagement' }).sort({ rankingDate: -1 }).lean()
+    ]);
+    const ids = [...new Set([...(recent?.entries || []), ...(engagement?.entries || [])].map(item => item.youtubeId))];
+    const queue = await QueuedVideo.find({ youtubeId: { $in: ids } }).select('youtubeId status approvalStatus').lean();
+    const queueState = new Map(queue.map(item => [item.youtubeId, `${item.approvalStatus}/${item.status}`]));
+    const currentQueueState = entries => (entries || []).map(item => ({ ...item, queueStatus: queueState.get(item.youtubeId) || 'NOT_QUEUED' }));
+    res.json({ source, profile, rankings: { recent: currentQueueState(recent?.entries), recentRankingDate: recent?.rankingDate || null, engagement: currentQueueState(engagement?.entries), engagementRankingDate: engagement?.rankingDate || null } });
+  } catch (error) { next(error); }
+});
+app.get('/api/trending', async (_req, res, next) => {
+  try {
+    const sources = await Source.find({ type: 'channel', enabled: true, trendingDiscoveryEnabled: true }).select('name adaptiveLastRunAt').lean();
+    const sourceIds = sources.map(source => source._id);
+    const [profiles, items] = await Promise.all([
+      ChannelProfile.find({ sourceId: { $in: sourceIds } }).select('sourceId projectedUploadsNext15Days uploadRateReliable').lean(),
+      AdaptiveVideo.find({ sourceId: { $in: sourceIds }, viewSurge: true }).sort({ viewVelocityPerDay: -1, viewSurgeDetectedAt: -1 }).lean()
+    ]);
+    const queueItems = await QueuedVideo.find({ youtubeId: { $in: items.map(item => item.youtubeId) } }).select('youtubeId status approvalStatus').lean();
+    const sourceById = new Map(sources.map(source => [String(source._id), source]));
+    const profileById = new Map(profiles.map(profile => [String(profile.sourceId), profile]));
+    const queueById = new Map(queueItems.map(item => [item.youtubeId, `${item.approvalStatus}/${item.status}`]));
+    res.json({
+      sources: sources.map(source => ({ sourceId: String(source._id), name: source.name, lastScanAt: source.adaptiveLastRunAt, ...(profileById.get(String(source._id)) || {}) })),
+      items: items.map(item => ({ ...item, channelName: item.channelName || sourceById.get(String(item.sourceId))?.name || '', queueStatus: queueById.get(item.youtubeId) || 'NOT_QUEUED' }))
+    });
+  } catch (error) { next(error); }
+});
+app.delete('/api/sources/:id', async (req, res, next) => {
+  try {
+    objectId(req.params.id);
+    const current = await Source.findById(req.params.id).select('name visualReferences +visualReferenceFileId');
+    if (!current) return res.status(404).json({ error: 'Source not found' });
+    const sourceId = current._id;
+    const fileIds = [...(current.visualReferences || []).map(ref => ref.fileId), current.visualReferenceFileId].filter(Boolean);
+    for (const fileId of fileIds) {
+      try { await imagekit.deleteFile(fileId); }
+      catch (err) { logger.warn('visual_reference_image_delete_failed', { sourceId: req.params.id, sourceName: current.name, provider: 'imagekit', fileId, message: err.message }); }
+    }
+
+    // Remove this source's attribution from shared queue entries. Keep a queued
+    // video when another source still references it; remove videos discovered
+    // only by the deleted source.
+    const queueItems = await QueuedVideo.find({ 'discoveredSources.sourceId': sourceId }).lean();
+    for (const item of queueItems) {
+      const remainingSources = (item.discoveredSources || []).filter(source => String(source.sourceId) !== String(sourceId));
+      if (!remainingSources.length) {
+        await QueuedVideo.deleteOne({ _id: item._id });
+        continue;
+      }
+      const matchedKeywords = [...new Set(remainingSources.flatMap(source => source.matchedKeywords || []))];
+      const priorityRank = { HIGH: 1, NORMAL: 2, LOW: 3 };
+      const bestPriority = remainingSources.reduce((best, source) => Math.min(best, priorityRank[source.priority] || 2), 3);
+      const priority = priorities[bestPriority - 1] || 'LOW';
+      await QueuedVideo.updateOne({ _id: item._id }, { $set: {
+        discoveredSources: remainingSources, matchedKeywords, priority, priorityRank: bestPriority
+      } });
+    }
+
+    const [history, scannedVideos, adaptiveVideos, profile, rankings, stats] = await Promise.all([
+      ScanHistory.deleteMany({ sourceId }),
+      ScannedVideoHistory.deleteMany({ sourceId }),
+      AdaptiveVideo.deleteMany({ sourceId }),
+      ChannelProfile.deleteMany({ sourceId }),
+      ChannelRanking.deleteMany({ sourceId }),
+      VideoStatsHistory.deleteMany({ sourceId })
+    ]);
+    await Source.deleteOne({ _id: sourceId });
+    logger.info('source_and_related_data_deleted', {
+      sourceId: req.params.id, sourceName: current.name, queueItems: queueItems.length,
+      scanHistory: history.deletedCount, adaptiveVideos: adaptiveVideos.deletedCount,
+      scannedVideos: scannedVideos.deletedCount,
+      channelProfiles: profile.deletedCount, channelRankings: rankings.deletedCount,
+      videoStatsHistory: stats.deletedCount, referenceImages: fileIds.length
+    });
+    res.json({ deleted: true, relatedDataDeleted: true });
+  } catch (e) { next(e); }
+});
 app.get('/api/queue', async (req, res, next) => { try {
   const page = Math.max(1, Math.min(1000000, Number.parseInt(req.query.page || '1', 10) || 1));
   const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit || '50', 10) || 50));
@@ -121,6 +334,21 @@ app.post('/api/scan', async (_req, res, next) => { try { if (scanPromise) return
 app.post('/api/scan/:sourceId', async (req, res, next) => { try { objectId(req.params.sourceId); const result = await scanner.scanOne(req.params.sourceId); res.json(result); } catch (e) { next(e); } });
 app.get('/api/scan-history', async (req, res, next) => { try { const page = Math.max(1, Number.parseInt(req.query.page || '1', 10) || 1); const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit || '50', 10) || 50)); const sort = requestedSort(req, { startedAt: 'startedAt', sourceName: 'sourceName', matched: 'matched', errors: 'errorCount' }, { startedAt: -1 }); if (!sort) return res.status(400).json({ error: 'Invalid scan history sort or order' }); const [items, total] = await Promise.all([ScanHistory.find().sort(sort).skip((page - 1) * limit).limit(limit).lean(), ScanHistory.countDocuments()]); res.json({ items, total, page, limit }); } catch (e) { next(e); } });
 app.get('/api/scan-history/:sourceId', async (req, res, next) => { try { objectId(req.params.sourceId); res.json(await ScanHistory.find({ sourceId: req.params.sourceId }).sort({ startedAt: -1 }).limit(100).lean()); } catch (e) { next(e); } });
+app.get('/api/scan-history/:sourceId/videos', async (req, res, next) => { try {
+  objectId(req.params.sourceId);
+  const page = Math.max(1, Number.parseInt(req.query.page || '1', 10) || 1); const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit || '25', 10) || 25));
+  const filter = { sourceId: req.params.sourceId }; const outcome = String(req.query.outcome || '');
+  if (['KEYWORD_REJECTED', 'GEMINI_REJECTED', 'ERROR', 'SKIPPED', 'MATCHED'].includes(outcome)) filter.result = outcome;
+  else if (['APPROVED', 'PENDING', 'REJECTED'].includes(outcome)) {
+    const decisions = await QueuedVideo.find({ 'discoveredSources.sourceId': new mongoose.Types.ObjectId(req.params.sourceId), approvalStatus: outcome }).select('youtubeId').lean();
+    filter.result = 'MATCHED'; filter.youtubeId = { $in: decisions.map(item => item.youtubeId) };
+  } else if (outcome === 'FILTERED') filter.result = { $in: ['KEYWORD_REJECTED', 'GEMINI_REJECTED'] };
+  const [items, total] = await Promise.all([ScannedVideoHistory.find(filter).sort({ scannedAt: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).lean(), ScannedVideoHistory.countDocuments(filter)]);
+  const ids = items.map(item => item.youtubeId);
+  const queueItems = await QueuedVideo.find({ youtubeId: { $in: ids }, 'discoveredSources.sourceId': new mongoose.Types.ObjectId(req.params.sourceId) }).select('youtubeId approvalStatus status').lean();
+  const decisions = new Map(queueItems.map(item => [item.youtubeId, item]));
+  res.json({ items: items.map(item => ({ ...item, approvalStatus: decisions.get(item.youtubeId)?.approvalStatus || null, importStatus: decisions.get(item.youtubeId)?.status || null })), total, page, limit });
+} catch (e) { next(e); } });
 app.get('/api/settings/scan', async (_req, res, next) => {
   try {
     const settings = await scheduler.getSettings();
@@ -156,7 +384,7 @@ async function start() {
   logger.info('server_starting', { port: Number(process.env.PORT || 3000), logLevel: process.env.LOG_LEVEL || 'info' });
   await connectDB();
   logger.info('mongodb_connected');
-  await Promise.all([Source.init(), QueuedVideo.init(), ScanHistory.init(), ScannerSettings.init()]);
+  await Promise.all([Source.init(), QueuedVideo.init(), ScanHistory.init(), ScannedVideoHistory.init(), ScannerSettings.init(), AdaptiveVideo.init(), ChannelProfile.init(), ChannelRanking.init(), VideoStatsHistory.init()]);
   await scanner.migrateLegacyThumbnailSetting();
   logger.info('mongodb_indexes_ready', { collections: ['sources', 'youtube_queue', 'scan_history', 'scanner_settings'] });
   const approvalHoldback = await QueuedVideo.updateMany({ status: 'PENDING', approvalStatus: { $ne: 'APPROVED' } }, { $set: { status: 'AWAITING_APPROVAL' } });

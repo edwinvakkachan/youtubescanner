@@ -1,6 +1,7 @@
 'use strict';
 const $ = s => document.querySelector(s);
-const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', sourceSearch: '', approvalChannelId: '', timer: null, sorts: {} };
+const state = { view: 'overview', page: 1, limit: 25, sourceType: 'channel', sourceSearch: '', sourceSearchRegex: false, approvalChannelId: '', sourceHistoryId: '', sourceDecision: '', timer: null, sorts: {}, trendingFilters: { sourceId: '', contentType: '', importStatus: '', sort: 'viewVelocityPerDay:desc' } };
+let visualPreviewUrls = [];
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
 function applyTheme(theme, persist = true) {
   const selected = theme === 'light' ? 'light' : 'dark';
@@ -20,6 +21,49 @@ async function api(url, options = {}) {
 }
 function toast(message, error = false) { const el = $('#notice'); el.textContent = message; el.className = `notice${error ? ' error' : ''}`; el.hidden = false; clearTimeout(state.timer); state.timer = setTimeout(() => { el.hidden = true; }, 4500); }
 function badge(value) { return `<span class="badge ${escapeHtml(value)}">${escapeHtml(value)}</span>`; }
+function compileSourceSearchRegex(pattern) {
+  if (pattern.length > 256) throw new Error('Regex search is limited to 256 characters');
+  if (/\\[1-9]|\([^)]*\)[*+{]/.test(pattern)) throw new Error('Backreferences and repeated groups are not supported in source search');
+  const quantifiers = pattern.match(/(?<!\\)[*+]|(?<!\\)\{\d+(?:,\d*)?\}/g) || [];
+  if (quantifiers.length > 8 || quantifiers.filter(q => q === '*' || q === '+').length > 3 || quantifiers.some(q => { const n = q.match(/\d+/); return n && Number(n[0]) > 1000; })) throw new Error('Use at most 8 simple regex quantifiers, including 3 unbounded repetitions (counts up to 1000)');
+  return new RegExp(pattern.normalize('NFC'), 'iu');
+}
+function applySourceSearch() {
+  const query = state.sourceSearch.trim();
+  let matcher = null; let errorMessage = '';
+  if (query && state.sourceSearchRegex) {
+    try { matcher = compileSourceSearchRegex(query); }
+    catch (err) { errorMessage = err.message; }
+  }
+  const error = $('#sourceSearchError');
+  if (error) { error.textContent = errorMessage; error.hidden = !errorMessage; }
+  let visible = 0;
+  $('#content').querySelectorAll('.source-card').forEach(card => {
+    const name = card.dataset.sourceName || '';
+    const url = card.dataset.sourceUrl || '';
+    const haystack = `${name} ${url}`;
+    const matches = !query || (state.sourceSearchRegex ? (matcher ? matcher.test(haystack) : true) : haystack.includes(query.normalize('NFC').toLocaleLowerCase()));
+    card.hidden = !matches;
+    if (!card.hidden) visible++;
+  });
+  const empty = $('#sourceSearchEmpty');
+  if (empty) empty.hidden = visible > 0 || Boolean(errorMessage);
+}
+function renderVisualReferences(saved = [], selectedFiles = []) {
+  visualPreviewUrls.forEach(url => URL.revokeObjectURL(url));
+  visualPreviewUrls = [];
+  const gallery = $('#visualReferenceGallery');
+  if (!gallery) return;
+  const savedCards = saved.map((ref, index) => `<div class="visual-reference-card"><img src="${escapeHtml(ref.url)}" alt="Reference image ${index + 1}">${ref._id ? `<button type="button" class="visual-reference-remove" data-reference-id="${escapeHtml(ref._id)}" aria-label="Remove reference image ${index + 1}">×</button>` : ''}</div>`);
+  const selectedCards = selectedFiles.map((file, index) => {
+    const url = URL.createObjectURL(file); visualPreviewUrls.push(url);
+    return `<div class="visual-reference-card visual-reference-pending"><img src="${url}" alt="Selected reference ${index + 1}"><span>${escapeHtml(file.name)}</span></div>`;
+  });
+  gallery.innerHTML = [...savedCards, ...selectedCards].join('');
+  const total = saved.length + selectedFiles.length;
+  $('#visualReferenceStatus').textContent = total ? `${saved.length} saved reference${saved.length === 1 ? '' : 's'}${selectedFiles.length ? ` · ${selectedFiles.length} selected to upload` : ''}` : 'No reference images uploaded';
+  $('#removeVisualReference').hidden = saved.length === 0;
+}
 function uniqueChannelSources(video) {
   const seen = new Set();
   return (video.discoveredSources || []).filter(source => source.type === 'channel').filter(source => {
@@ -54,10 +98,47 @@ async function renderOverview() {
 }
 async function renderSources() {
   const sources = await api('/api/sources');
-  const tabs = `<div class="toolbar"><label class="source-search">Search sources<input id="sourceSearch" type="search" placeholder="Channel or source name" value="${escapeHtml(state.sourceSearch)}"></label>${['channel', 'playlist', 'shorts'].map(t => `<button class="smallbtn ${state.sourceType === t ? 'active' : ''}" data-type="${t}">${t[0].toUpperCase() + t.slice(1)} (${sources.filter(s => s.type === t).length})</button>`).join('')}<button class="button primary" id="addSource">+ Add source</button></div>`;
+  const tabs = `<div class="toolbar"><label class="source-search">Search sources<input id="sourceSearch" type="search" placeholder="Channel/source name or regex" value="${escapeHtml(state.sourceSearch)}"></label><label class="source-regex-toggle"><input id="sourceSearchRegex" type="checkbox" ${state.sourceSearchRegex ? 'checked' : ''}> Regex</label>${['channel', 'playlist', 'shorts'].map(t => `<button class="smallbtn ${state.sourceType === t ? 'active' : ''}" data-type="${t}">${t[0].toUpperCase() + t.slice(1)} (${sources.filter(s => s.type === t).length})</button>`).join('')}<button class="button primary" id="addSource">+ Add source</button></div><p class="sub regex-search-error" id="sourceSearchError" hidden></p>`;
   const shown = sources.filter(s => s.type === state.sourceType);
-  const cards = shown.length ? `<div class="source-grid">${shown.map(s => `<article class="source-card" data-source-name="${escapeHtml(s.name.toLocaleLowerCase())}"><div class="source-title"><div><h3>${escapeHtml(s.name)}</h3><div class="source-url" title="${escapeHtml(s.url)}">${escapeHtml(s.url)}</div></div>${badge(s.enabled ? 'ENABLED' : 'DISABLED')}</div><div class="tagrow">${badge(s.priority)}<span class="tag">${escapeHtml(s.matchMode)} match</span><span class="tag">${s.videosPerScan || 50} videos/scan</span><span class="tag">Description ${s.scanDescription === false && !s.generateNfo ? 'off' : 'on'}</span>${s.generateNfo ? '<span class="tag">NFO enabled</span>' : ''}${s.thumbnailGeminiEnabled ? '<span class="tag">Gemini thumbnail analysis enabled</span>' : ''}${(s.keywords || []).map(k => `<span class="tag">${escapeHtml(k)}</span>`).join('')}${(s.excludeKeywords || []).map(k => `<span class="tag">− ${escapeHtml(k)}</span>`).join('')}</div><div class="cardfoot"><small>Last scan: ${s.lastScannedAt ? new Date(s.lastScannedAt).toLocaleString() : 'Never scanned'}</small><div class="actions"><button class="smallbtn" data-act="scan-source" data-id="${s._id}">Scan</button><button class="smallbtn" data-act="toggle-gemini" data-id="${s._id}">${s.thumbnailGeminiEnabled ? 'Disable Gemini' : 'Enable Gemini'}</button><button class="smallbtn" data-act="edit-source" data-id="${s._id}">Edit</button><button class="smallbtn" data-act="toggle-source" data-id="${s._id}">${s.enabled ? 'Disable' : 'Enable'}</button><button class="smallbtn" data-act="delete-source" data-id="${s._id}">Delete</button></div></div></article>`).join('')}</div><div id="sourceSearchEmpty" class="empty" hidden><strong>No matching sources</strong>Try another source name.</div>` : '<div class="empty"><strong>No sources configured</strong>Add a YouTube channel, playlist, or Shorts source to start discovering videos.</div>';
+  const cards = shown.length ? `<div class="source-grid">${shown.map(s => `<article class="source-card" data-source-name="${escapeHtml(s.name.normalize('NFC').toLocaleLowerCase())}" data-source-url="${escapeHtml(s.url.normalize('NFC').toLocaleLowerCase())}"><div class="source-title"><div><h3>${escapeHtml(s.name)}</h3><div class="source-url" title="${escapeHtml(s.url)}">${escapeHtml(s.url)}</div></div>${badge(s.enabled ? 'ENABLED' : 'DISABLED')}</div><div class="tagrow">${badge(s.priority)}<span class="tag">${escapeHtml(s.matchMode)} match</span><span class="tag">${s.videosPerScan || 50} videos/scan</span>${s.adaptiveDiscoveryEnabled ? '<span class="tag">Adaptive Top 10</span>' : ''}${s.trendingDiscoveryEnabled ? '<span class="tag">Trending</span>' : ''}<span class="tag">Description ${s.scanDescription === false && !s.generateNfo ? 'off' : 'on'}</span>${s.generateNfo ? '<span class="tag">NFO enabled</span>' : ''}${s.thumbnailGeminiEnabled ? '<span class="tag">Gemini thumbnail analysis enabled</span>' : ''}${(s.keywords || []).map(k => `<span class="tag">${escapeHtml(k)}</span>`).join('')}${(s.excludeKeywords || []).map(k => `<span class="tag">− ${escapeHtml(k)}</span>`).join('')}</div><div class="cardfoot"><small>Last scan: ${s.lastScannedAt ? new Date(s.lastScannedAt).toLocaleString() : 'Never scanned'}</small><div class="actions"><button class="smallbtn" data-act="source-history" data-id="${s._id}">History</button><button class="smallbtn" data-act="scan-source" data-id="${s._id}">Scan</button>${s.adaptiveDiscoveryEnabled ? `<button class="smallbtn" data-act="adaptive-rankings" data-id="${s._id}">Top 10</button>` : ''}<button class="smallbtn" data-act="toggle-gemini" data-id="${s._id}">${s.thumbnailGeminiEnabled ? 'Disable Gemini' : 'Enable Gemini'}</button><button class="smallbtn" data-act="edit-source" data-id="${s._id}">Edit</button><button class="smallbtn" data-act="toggle-source" data-id="${s._id}">${s.enabled ? 'Disable' : 'Enable'}</button><button class="smallbtn" data-act="delete-source" data-id="${s._id}">Delete</button></div></div></article>`).join('')}</div><div id="sourceSearchEmpty" class="empty" hidden><strong>No matching sources</strong>Try another source name.</div>` : '<div class="empty"><strong>No sources configured</strong>Add a YouTube channel, playlist, or Shorts source to start discovering videos.</div>';
   $('#content').innerHTML = `${shell('Manage sources', 'Configure YouTube sources and their discovery rules', tabs)}${cards}</div>`;
+}
+function adaptiveRankingTable(title, rows) {
+  if (!rows.length) return `<div class="panel"><h2>${title}</h2><div class="empty">No ranked videos yet. Run a source scan to populate this list.</div></div>`;
+  return `<div class="panel"><div class="panelhead"><h2>${title}</h2></div><div class="tablewrap"><table><thead><tr><th>Rank</th><th>Video</th><th>Views</th><th>Likes</th><th>Comments</th><th>Engagement</th><th>Relative</th><th>Import</th><th>Keyword result</th></tr></thead><tbody>${rows.map(item => `<tr><td>${item.rank}</td><td><div class="videocell"><img class="thumb" src="${escapeHtml(item.thumbnail || '')}" alt=""><a class="title" href="${escapeHtml(item.videoUrl || `https://www.youtube.com/watch?v=${item.youtubeId}`)}" target="_blank" rel="noopener">${escapeHtml(item.title || item.youtubeId)}</a></div></td><td>${item.views == null ? '—' : Number(item.views).toLocaleString()}</td><td>${item.likes == null ? '—' : Number(item.likes).toLocaleString()}</td><td>${item.comments == null ? '—' : Number(item.comments).toLocaleString()}</td><td>${item.engagementRate == null ? '—' : `${Number(item.engagementRate).toFixed(2)}%`}</td><td>${item.relativeEngagement == null ? '—' : `${Number(item.relativeEngagement).toFixed(2)}×`}</td><td>${escapeHtml(item.queueStatus || '—')}</td><td>${item.accepted === false ? `<span class="rejection-reason">Rejected: ${escapeHtml(item.rejectionReason || 'Keyword rule')}</span>` : `Accepted${item.matchedKeywords?.length ? ` · ${escapeHtml(item.matchedKeywords.join(', '))}` : ''}`}</td></tr>`).join('')}</tbody></table></div></div>`;
+}
+async function renderAdaptiveRankings(sourceId) {
+  const data = await api(`/api/adaptive/${sourceId}`); const profile = data.profile || {};
+  $('#heading').textContent = `${data.source.name} · Top 10`; $('#crumb').textContent = 'WORKSPACE / ADAPTIVE RANKINGS';
+  const metric = (label, value) => `<div class="stat"><div class="label">${label}</div><strong>${value}</strong></div>`;
+  $('#content').innerHTML = `<div class="panel"><div class="panelhead"><div><h2>Adaptive channel profile</h2><p>Updated ${profile.calculatedAt ? new Date(profile.calculatedAt).toLocaleString() : 'after the first adaptive scan'} · Last scan ${data.source.adaptiveLastRunAt ? new Date(data.source.adaptiveLastRunAt).toLocaleString() : 'not run'}</p></div><button class="button" id="backToSources">Back to sources</button></div><div class="stats">${metric('Candidates', profile.candidateCount ?? 0)}${metric('25th percentile view threshold', profile.minimumViewsThreshold == null ? '—' : Number(profile.minimumViewsThreshold).toLocaleString())}${metric('Median views', profile.medianViews == null ? '—' : Number(profile.medianViews).toLocaleString())}${metric('Median engagement', profile.medianEngagementRate == null ? '—' : `${Number(profile.medianEngagementRate).toFixed(2)}%`)}${metric('Uploads / day · 7d', Number(profile.averageUploadsPerDay7d || 0).toFixed(2))}${metric('Uploads / day · 30d', Number(profile.averageUploadsPerDay30d || 0).toFixed(2))}</div><p class="sub">${profile.thresholdProvisional ? 'View threshold is provisional because fewer than 30 candidates were available.' : 'Engagement ranking uses the channel-specific 25th percentile view threshold.'} New ranked videos enter the existing TubeArchivist import queue.</p></div>${adaptiveRankingTable('Recent Top 10', data.rankings.recent)}${adaptiveRankingTable('Engagement Top 10', data.rankings.engagement)}`;
+}
+async function renderTrending() {
+  const data = await api('/api/trending');
+  $('#heading').textContent = 'Trending videos'; $('#crumb').textContent = 'WORKSPACE / VIEW SURGES';
+  const filters = state.trendingFilters;
+  const allRows = data.items || [];
+  const statusParts = item => { const value = String(item.queueStatus || 'NOT_QUEUED'); return value === 'NOT_QUEUED' ? ['NOT_QUEUED', 'NOT_QUEUED'] : value.split('/'); };
+  const matchesStatus = (item, filter) => {
+    if (!filter) return true;
+    const [approvalStatus, importStatus] = statusParts(item);
+    return filter === 'NOT_QUEUED' ? importStatus === 'NOT_QUEUED' : filter === approvalStatus || filter === importStatus;
+  };
+  const rows = allRows.filter(item => (!filters.sourceId || String(item.sourceId) === filters.sourceId)
+    && (!filters.contentType || item.contentType === filters.contentType)
+    && matchesStatus(item, filters.importStatus));
+  const [sortKey, sortDirection] = (filters.sort || 'viewVelocityPerDay:desc').split(':');
+  rows.sort((a, b) => {
+    const left = a[sortKey]; const right = b[sortKey];
+    const order = sortDirection === 'asc' ? 1 : -1;
+    if (typeof left === 'string' || typeof right === 'string') return String(left || '').localeCompare(String(right || '')) * order;
+    return ((Number(left ?? -Infinity) - Number(right ?? -Infinity)) * order) || String(a.youtubeId).localeCompare(String(b.youtubeId));
+  });
+  const filterOptions = `<div class="toolbar trending-filters"><label class="source-filter">Channel <select data-trending-filter="sourceId"><option value="">All channels</option>${(data.sources || []).map(source => `<option value="${escapeHtml(source.sourceId)}" ${filters.sourceId === String(source.sourceId) ? 'selected' : ''}>${escapeHtml(source.name)}</option>`).join('')}</select></label><label class="source-filter">Type <select data-trending-filter="contentType"><option value="">Videos and Shorts</option><option value="video" ${filters.contentType === 'video' ? 'selected' : ''}>Videos</option><option value="short" ${filters.contentType === 'short' ? 'selected' : ''}>Shorts</option></select></label><label class="source-filter">Import status <select data-trending-filter="importStatus"><option value="">All statuses</option><option value="NOT_QUEUED" ${filters.importStatus === 'NOT_QUEUED' ? 'selected' : ''}>Not queued</option><option value="AWAITING_APPROVAL" ${filters.importStatus === 'AWAITING_APPROVAL' ? 'selected' : ''}>Awaiting approval</option><option value="APPROVED" ${filters.importStatus === 'APPROVED' ? 'selected' : ''}>Approved</option><option value="REJECTED" ${filters.importStatus === 'REJECTED' ? 'selected' : ''}>Rejected</option><option value="PENDING" ${filters.importStatus === 'PENDING' ? 'selected' : ''}>Pending import</option><option value="PROCESSING" ${filters.importStatus === 'PROCESSING' ? 'selected' : ''}>Processing</option><option value="SENT" ${filters.importStatus === 'SENT' ? 'selected' : ''}>Sent</option><option value="PROCESSED" ${filters.importStatus === 'PROCESSED' ? 'selected' : ''}>Processed</option><option value="FAILED" ${filters.importStatus === 'FAILED' ? 'selected' : ''}>Failed</option></select></label><label class="sort-control">Sort by <select data-trending-sort><option value="viewVelocityPerDay:desc" ${filters.sort === 'viewVelocityPerDay:desc' ? 'selected' : ''}>Fastest view growth</option><option value="views:desc" ${filters.sort === 'views:desc' ? 'selected' : ''}>Most views</option><option value="likes:desc" ${filters.sort === 'likes:desc' ? 'selected' : ''}>Most likes</option><option value="lastDailyLikeGrowth:desc" ${filters.sort === 'lastDailyLikeGrowth:desc' ? 'selected' : ''}>Largest daily like gain</option><option value="publishedAt:desc" ${filters.sort === 'publishedAt:desc' ? 'selected' : ''}>Newest upload</option><option value="viewSurgeDetectedAt:desc" ${filters.sort === 'viewSurgeDetectedAt:desc' ? 'selected' : ''}>Recently detected</option><option value="channelName:asc" ${filters.sort === 'channelName:asc' ? 'selected' : ''}>Channel A–Z</option></select></label></div>`;
+  const badgeStatus = (value, title) => `<span class="badge ${escapeHtml(value)}" title="${escapeHtml(title)}">${escapeHtml(value.replaceAll('_', ' '))}</span>`;
+  const body = rows.length ? `<div class="tablewrap"><table class="trending-table"><thead><tr><th>Video</th><th>Channel</th><th>Views</th><th>View change / day</th><th>Likes</th><th>Like change / day</th><th>Surge threshold / day</th><th>Detected</th><th>Import status</th><th>Keyword result</th></tr></thead><tbody>${rows.map(item => { const [approvalStatus, importStatus] = statusParts(item); return `<tr><td><div class="videocell"><img class="thumb" src="${escapeHtml(item.thumbnail || '')}" onerror="this.style.visibility='hidden'" alt=""><a class="title" href="${escapeHtml(item.videoUrl || `https://www.youtube.com/watch?v=${item.youtubeId}`)}" target="_blank" rel="noopener">${escapeHtml(item.title || item.youtubeId)}</a></div></td><td>${escapeHtml(item.channelName || '—')}</td><td>${item.views == null ? '—' : Number(item.views).toLocaleString()}</td><td>${item.viewVelocityPerDay == null ? '—' : Math.round(item.viewVelocityPerDay).toLocaleString()}</td><td>${item.likes == null ? '—' : Number(item.likes).toLocaleString()}</td><td>${item.lastDailyLikeGrowth == null ? '—' : Math.round(item.lastDailyLikeGrowth).toLocaleString()}</td><td>${item.surgeThresholdPerDay == null ? '—' : Math.round(item.surgeThresholdPerDay).toLocaleString()}</td><td>${item.viewSurgeDetectedAt ? new Date(item.viewSurgeDetectedAt).toLocaleString() : '—'}</td><td><div class="status-pair">${approvalStatus === 'NOT_QUEUED' ? badgeStatus('NOT_QUEUED', 'Import status') : `<span class="status-line"><small>Approval</small>${badgeStatus(approvalStatus, 'Approval status')}</span><span class="status-line"><small>Import</small>${badgeStatus(importStatus, 'Import status')}</span>`}</div></td><td>${item.rejectionReason ? `<span class="rejection-reason">Rejected: ${escapeHtml(item.rejectionReason)}</span>` : item.queueStatus === 'NOT_QUEUED' ? 'Not queued' : `Accepted${item.matchedKeywords?.length ? ` · ${escapeHtml(item.matchedKeywords.join(', '))}` : ''}`}</td></tr>`; }).join('')}</tbody></table></div>` : `<div class="empty"><strong>${allRows.length ? 'No surges match these filters' : 'No view surges detected'}</strong>${allRows.length ? 'Change or clear a filter to see other detected surges.' : 'Trending scans store the latest 90 videos first. Surges appear when a video’s daily view rate rises above its channel-specific baseline.'}</div>`;
+  const sourceSummary = (data.sources || []).map(source => `${escapeHtml(source.name)}: 15-day upload forecast ${source.projectedUploadsNext15Days ?? '—'} videos${source.uploadRateReliable ? '' : ' (building reliable history)'}`).join(' · ');
+  $('#content').innerHTML = `${shell('Trending videos', `Only detected view surges are listed. Likes are tracked when YouTube provides them; public dislike counts are unavailable. ${sourceSummary}`, '<button class="button" id="refreshTrending">Refresh</button>')}${filterOptions}<div class="panel">${body}</div></div>`;
 }
 const views = {
   approval: ['Pending Approval', 'Review matches before the importer can retrieve them', { approvalStatus: 'PENDING' }],
@@ -90,14 +171,34 @@ async function renderHistory() {
   const body = d.items.length ? `<div class="tablewrap"><table><thead><tr><th>Source</th><th>Status</th><th>Started</th><th>Completed</th><th>Inspected</th><th>Matched</th><th>Rejected</th><th>Errors</th></tr></thead><tbody>${d.items.map(x => `<tr><td><b>${escapeHtml(x.sourceName)}</b><div class="sub">${escapeHtml(x.sourceType)}</div></td><td>${badge(x.status)}</td><td>${x.startedAt ? new Date(x.startedAt).toLocaleString() : '—'}</td><td>${x.completedAt ? new Date(x.completedAt).toLocaleString() : '—'}</td><td>${x.inspected}</td><td>${x.matched}</td><td>${x.rejected}</td><td>${x.errorCount ?? x.errors ?? 0}${x.errorDetails?.length ? `<div class="sub historydetails" title="${escapeHtml(x.errorDetails.join('\n'))}">${escapeHtml(x.errorDetails[0])}</div>` : ''}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No scans have run.</div>';
   $('#content').innerHTML = `${shell('Scan history', 'Recorded source scans and extraction errors', sortControl(historySorts, 'startedAt:desc'))}${body}${paging(d)}</div>`;
 }
+async function renderSourceHistory() {
+  const sourceId = state.sourceHistoryId;
+  const [sources, scans] = await Promise.all([api('/api/sources'), api(`/api/scan-history/${encodeURIComponent(sourceId)}`)]);
+  const source = sources.find(s => s._id === sourceId);
+  const name = source?.name || scans[0]?.sourceName || 'Deleted source';
+  const qs = new URLSearchParams({ page: String(state.page), limit: String(state.limit) });
+  if (state.sourceDecision) qs.set('outcome', state.sourceDecision);
+  const videos = await api(`/api/scan-history/${encodeURIComponent(sourceId)}/videos?${qs}`);
+  const scansTable = scans.length ? `<div class="tablewrap"><table><thead><tr><th>Scan</th><th>Status</th><th>Inspected</th><th>Matched</th><th>Rejected</th><th>Errors</th></tr></thead><tbody>${scans.map(x => `<tr><td>${x.startedAt ? new Date(x.startedAt).toLocaleString() : '—'}</td><td>${badge(x.status)}</td><td>${x.inspected ?? 0}</td><td>${x.matched ?? 0}</td><td>${x.rejected ?? 0}</td><td>${x.errorCount ?? 0}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No scan records for this source.</div>';
+  const outcomes = [['','All outcomes'],['APPROVED','Approved'],['PENDING','Pending approval'],['REJECTED','Manually rejected'],['KEYWORD_REJECTED','Rejected by keywords'],['GEMINI_REJECTED','Rejected by Gemini'],['ERROR','Scan error'],['SKIPPED','Skipped'],['MATCHED','Matched videos']];
+  const decision = `<label class="source-filter">Outcome <select id="sourceDecisionFilter">${outcomes.map(([v,label]) => `<option value="${v}" ${state.sourceDecision === v ? 'selected' : ''}>${label}</option>`).join('')}</select></label>`;
+  const videoTable = videos.items.length ? `<div class="tablewrap"><table><thead><tr><th>Video</th><th>Outcome</th><th>Reason / matched keywords</th><th>Scanned</th></tr></thead><tbody>${videos.items.map(item => {
+    const label = item.approvalStatus === 'APPROVED' ? 'APPROVED' : item.approvalStatus === 'REJECTED' ? 'MANUALLY REJECTED' : item.approvalStatus === 'PENDING' ? 'PENDING APPROVAL' : item.result;
+    const detail = item.rejectionReason || (item.matchedKeywords?.length ? `Matched: ${item.matchedKeywords.join(', ')}` : '—');
+    return `<tr><td><div class="videocell"><img class="thumb" src="${escapeHtml(item.thumbnail || '')}" onerror="this.style.visibility='hidden'" alt=""><div><a class="title" href="${escapeHtml(item.url || `https://www.youtube.com/watch?v=${item.youtubeId}`)}" target="_blank" rel="noopener">${escapeHtml(item.title || item.youtubeId)}</a><div class="sub">${escapeHtml(item.youtubeId)}</div></div></div></td><td>${badge(label)}</td><td class="historydetails">${escapeHtml(detail)}</td><td>${item.scannedAt ? new Date(item.scannedAt).toLocaleString() : '—'}</td></tr>`;
+  }).join('')}</tbody></table></div>` : '<div class="empty">No scanned videos match this outcome. Individual video history is recorded from scans made after this update.</div>';
+  $('#content').innerHTML = `${shell(`${escapeHtml(name)} history`, 'Every inspected video with approval and filtering outcomes', '<button class="button" id="backToSources">Back to sources</button>')}<h3 class="history-section-title">Scans</h3>${scansTable}<div class="panelhead source-history-videos"><div><h3>Scanned videos</h3><p>Includes approved, manually rejected, keyword-filtered, and Gemini-filtered videos</p></div>${decision}</div>${videoTable}${paging(videos)}</div>`;
+}
 async function render() {
   state.page = Math.max(1, state.page);
   $('#nav').querySelectorAll('.navitem').forEach(b => b.classList.toggle('active', b.dataset.view === state.view));
   await stats();
   if (state.view === 'overview') return renderOverview();
   if (state.view === 'sources') return renderSources();
+  if (state.view === 'trending') return renderTrending();
   if (state.view === 'keywords') return renderKeywords();
   if (state.view === 'history') return renderHistory();
+  if (state.view === 'source-history') return renderSourceHistory();
   return renderQueue(state.view);
 }
 function showSource(source = null) {
@@ -105,21 +206,120 @@ function showSource(source = null) {
   form.elements.enabled.checked = source?.enabled ?? true;
   form.elements.autoApproveVideos.checked = source?.autoApproveVideos ?? false;
   form.elements.videosPerScan.value = source?.videosPerScan || 50;
+  form.elements.adaptiveDiscoveryEnabled.checked = source?.adaptiveDiscoveryEnabled ?? false;
+  form.elements.trendingDiscoveryEnabled.checked = source?.trendingDiscoveryEnabled ?? false;
+  form.elements.dailyTopVideosEnabled.checked = source?.dailyTopVideosEnabled ?? false;
+  form.elements.dailyTopVideosCount.value = source?.dailyTopVideosCount ?? 1;
+  form.elements.adaptiveContentType.value = source?.adaptiveContentType ?? 'BOTH';
   form.elements.generateNfo.checked = source?.generateNfo ?? false;
   form.elements.thumbnailGeminiEnabled.checked = source?.thumbnailGeminiEnabled ?? false;
+  form.elements.keywordSearchMode.value = source?.keywordSearchMode ?? 'TEXT';
+  form.elements.visualMatchEnabled.checked = source?.visualMatchEnabled ?? false;
+  form.elements.visualMatchAutoApprove.checked = source?.visualMatchAutoApprove ?? true;
+  form.elements.visualMatchAction.value = source?.visualMatchAction ?? 'ACCEPT';
+  const savedReferences = source?.visualReferences?.length ? source.visualReferences : source?.visualReferenceUrl ? [{ url: source.visualReferenceUrl, mimeType: source.visualReferenceMimeType }] : [];
+  form.dataset.hasVisualReference = String(savedReferences.length > 0 || Boolean(source?.visualReferenceMimeType));
+  form.dataset.visualReferenceCount = String(savedReferences.length);
+  form.dataset.savedVisualReferences = JSON.stringify(savedReferences);
+  renderVisualReferences(savedReferences);
+  if (!savedReferences.length && source?.visualReferenceMimeType) {
+    $('#visualReferenceStatus').textContent = 'Legacy reference saved; its thumbnail will appear after ImageKit migration';
+    $('#removeVisualReference').hidden = false;
+  }
+  $('#visualMatchActionField').hidden = !form.elements.visualMatchEnabled.checked;
+  $('#visualAutoApproveField').hidden = !form.elements.visualMatchEnabled.checked || form.elements.visualMatchAction.value === 'REJECT';
   form.elements.scanDescription.checked = source?.scanDescription !== false || form.elements.generateNfo.checked;
   for (const key of ['name', 'url', 'type', 'priority', 'matchMode']) if (source && source[key] !== undefined) form.elements[key].value = source[key];
   $('#autoApproveField').hidden = form.elements.type.value !== 'channel';
-  form.elements.keywords.value = (source?.keywords || []).join(', '); form.elements.excludeKeywords.value = (source?.excludeKeywords || []).join(', '); $('#sourceDialog').showModal();
+  $('#adaptiveDiscoveryField').hidden = form.elements.type.value !== 'channel';
+  $('#adaptiveDiscoveryHelp').hidden = form.elements.type.value !== 'channel';
+  $('#trendingDiscoveryField').hidden = form.elements.type.value !== 'channel';
+  $('#dailyTopVideosField').hidden = form.elements.type.value !== 'channel';
+  $('#dailyTopVideosHelp').hidden = form.elements.type.value !== 'channel';
+  $('#dailyTopVideosCountField').hidden = form.elements.type.value !== 'channel' || !form.elements.dailyTopVideosEnabled.checked;
+  $('#trendingDiscoveryHelp').hidden = form.elements.type.value !== 'channel';
+  $('#adaptiveContentTypeField').hidden = form.elements.type.value !== 'channel' || !(form.elements.adaptiveDiscoveryEnabled.checked || form.elements.trendingDiscoveryEnabled.checked || form.elements.dailyTopVideosEnabled.checked);
+  form.dataset.keywordSearchMode = form.elements.keywordSearchMode.value;
+  form.elements.keywords.value = formatKeywordEntries(source?.keywords || [], form.elements.keywordSearchMode.value);
+  form.elements.excludeKeywords.value = formatKeywordEntries(source?.excludeKeywords || [], form.elements.keywordSearchMode.value);
+  updateKeywordSearchHelp(form.elements.keywordSearchMode.value);
+  $('#sourceDialog').showModal();
 }
-$('#sourceForm').elements.type.addEventListener('change', e => { $('#autoApproveField').hidden = e.target.value !== 'channel'; });
+$('#sourceForm').elements.visualMatchEnabled.addEventListener('change', e => { $('#visualAutoApproveField').hidden = !e.target.checked || e.currentTarget.form.elements.visualMatchAction.value === 'REJECT'; $('#visualMatchActionField').hidden = !e.target.checked; });
+$('#sourceForm').elements.adaptiveDiscoveryEnabled.addEventListener('change', e => { const form = e.currentTarget.form; if (e.target.checked) { form.elements.trendingDiscoveryEnabled.checked = false; form.elements.dailyTopVideosEnabled.checked = false; } $('#dailyTopVideosCountField').hidden = form.elements.type.value !== 'channel' || !form.elements.dailyTopVideosEnabled.checked; $('#adaptiveContentTypeField').hidden = form.elements.type.value !== 'channel' || !(e.target.checked || form.elements.trendingDiscoveryEnabled.checked); });
+$('#sourceForm').elements.trendingDiscoveryEnabled.addEventListener('change', e => { const form = e.currentTarget.form; if (e.target.checked) { form.elements.adaptiveDiscoveryEnabled.checked = false; form.elements.dailyTopVideosEnabled.checked = false; } $('#dailyTopVideosCountField').hidden = form.elements.type.value !== 'channel' || !form.elements.dailyTopVideosEnabled.checked; $('#adaptiveContentTypeField').hidden = form.elements.type.value !== 'channel' || !(e.target.checked || form.elements.adaptiveDiscoveryEnabled.checked); });
+$('#sourceForm').elements.dailyTopVideosEnabled.addEventListener('change', e => { const form=e.currentTarget.form; if(e.target.checked){form.elements.adaptiveDiscoveryEnabled.checked=false;form.elements.trendingDiscoveryEnabled.checked=false;} $('#dailyTopVideosCountField').hidden=form.elements.type.value!=='channel'||!e.target.checked; $('#adaptiveContentTypeField').hidden=form.elements.type.value!=='channel'||!(form.elements.adaptiveDiscoveryEnabled.checked||form.elements.trendingDiscoveryEnabled.checked||e.target.checked); });
+$('#sourceForm').elements.visualMatchAction.addEventListener('change', e => { $('#visualAutoApproveField').hidden = !e.currentTarget.form.elements.visualMatchEnabled.checked || e.target.value === 'REJECT'; });
+$('#sourceForm').elements.keywordSearchMode.addEventListener('change', e => {
+  const form = e.currentTarget.form; const oldMode = form.dataset.keywordSearchMode || 'TEXT'; const newMode = e.target.value;
+  form.elements.keywords.value = formatKeywordEntries(parseKeywordEntries(form.elements.keywords.value, oldMode), newMode);
+  form.elements.excludeKeywords.value = formatKeywordEntries(parseKeywordEntries(form.elements.excludeKeywords.value, oldMode), newMode);
+  form.dataset.keywordSearchMode = newMode;
+  updateKeywordSearchHelp(newMode);
+});
+$('#sourceForm').elements.visualReferenceFile.addEventListener('change', e => {
+  const files = [...e.target.files];
+  if (files.length) { e.currentTarget.form.elements.visualMatchEnabled.checked = true; $('#visualAutoApproveField').hidden = e.currentTarget.form.elements.visualMatchAction.value === 'REJECT'; $('#visualMatchActionField').hidden = false; }
+  const saved = e.currentTarget.form.dataset.savedVisualReferences ? JSON.parse(e.currentTarget.form.dataset.savedVisualReferences) : [];
+  renderVisualReferences(saved, files);
+});
+$('#visualReferenceGallery').addEventListener('click', async e => {
+  const button = e.target.closest('[data-reference-id]'); if (!button) return;
+  const form = $('#sourceForm'); const sourceId = form.elements.id.value; const referenceId = button.dataset.referenceId;
+  try {
+    const result = await api(`/api/sources/${sourceId}/visual-references/${referenceId}`, { method: 'DELETE' });
+    form.dataset.savedVisualReferences = JSON.stringify(result.visualReferences || []);
+    form.dataset.visualReferenceCount = String(result.visualReferences?.length || 0);
+    form.dataset.hasVisualReference = String(Boolean(result.visualReferences?.length));
+    if (!result.visualMatchEnabled) form.elements.visualMatchEnabled.checked = false;
+    renderVisualReferences(result.visualReferences || [], [...form.elements.visualReferenceFile.files]);
+    $('#visualAutoApproveField').hidden = !result.visualMatchEnabled || form.elements.visualMatchAction.value === 'REJECT'; $('#visualMatchActionField').hidden = !result.visualMatchEnabled;
+    toast('Reference image removed');
+  } catch (err) { toast(err.message, true); }
+});
+$('#removeVisualReference').addEventListener('click', async () => {
+  const form = $('#sourceForm'); const id = form.elements.id.value;
+  try {
+    if (id && form.dataset.hasVisualReference === 'true') await api(`/api/sources/${id}/visual-reference`, { method: 'DELETE' });
+    form.dataset.hasVisualReference = 'false'; form.elements.visualReferenceFile.value = ''; form.elements.visualMatchEnabled.checked = false;
+    form.dataset.visualReferenceCount = '0'; form.dataset.savedVisualReferences = '[]';
+    renderVisualReferences(); $('#visualMatchActionField').hidden = true; $('#visualAutoApproveField').hidden = true;
+    toast('All reference images removed');
+  } catch (err) { toast(err.message, true); }
+});
+$('#sourceForm').elements.type.addEventListener('change', e => { const form = e.currentTarget.form; $('#autoApproveField').hidden = e.target.value !== 'channel'; $('#adaptiveDiscoveryField').hidden = e.target.value !== 'channel'; $('#adaptiveDiscoveryHelp').hidden = e.target.value !== 'channel'; $('#trendingDiscoveryField').hidden = e.target.value !== 'channel'; $('#trendingDiscoveryHelp').hidden = e.target.value !== 'channel'; $('#dailyTopVideosField').hidden = e.target.value !== 'channel'; $('#dailyTopVideosHelp').hidden = e.target.value !== 'channel'; $('#dailyTopVideosCountField').hidden = e.target.value !== 'channel' || !form.elements.dailyTopVideosEnabled.checked; $('#adaptiveContentTypeField').hidden = e.target.value !== 'channel' || !(form.elements.adaptiveDiscoveryEnabled.checked || form.elements.trendingDiscoveryEnabled.checked || form.elements.dailyTopVideosEnabled.checked); });
 function splitWords(s) { return s.split(',').map(x => x.trim()).filter(Boolean); }
-async function fillKeywords(source) {
-  const box = $('#keywordEditor'); box.className = ''; box.innerHTML = `<div class="formgrid"><label>Include keywords<small> (comma separated)</small><textarea id="kwIncludes" rows="4">${escapeHtml((source.keywords || []).join(', '))}</textarea></label><label>Exclude keywords<small> (always take priority)</small><textarea id="kwExcludes" rows="4">${escapeHtml((source.excludeKeywords || []).join(', '))}</textarea></label><label>Match mode<select id="kwMode"><option ${source.matchMode === 'ANY' ? 'selected' : ''}>ANY</option><option ${source.matchMode === 'ALL' ? 'selected' : ''}>ALL</option></select></label><div class="actions"><button class="button" id="clearKeywords">Delete all keywords</button><button class="button primary" id="saveKeywords">Save keyword rules</button></div></div>`;
-  $('#saveKeywords').onclick = async () => { await api(`/api/sources/${source._id}`, { method: 'PUT', body: JSON.stringify({ keywords: splitWords($('#kwIncludes').value), excludeKeywords: splitWords($('#kwExcludes').value), matchMode: $('#kwMode').value }) }); toast('Keyword rules saved'); await render(); };
-  $('#clearKeywords').onclick = async () => { await api(`/api/sources/${source._id}`, { method: 'PUT', body: JSON.stringify({ keywords: [], excludeKeywords: [] }) }); toast('All keywords cleared'); await render(); };
+function parseKeywordEntries(value, mode = 'TEXT') {
+  return mode === 'REGEX' ? value.split(/\r?\n/).map(part => part.trim()).filter(Boolean) : splitWords(value);
 }
-$('#nav').addEventListener('click', e => { const b = e.target.closest('[data-view]'); if (!b) return; state.view = b.dataset.view; state.page = 1; render().catch(err => toast(err.message, true)); });
+function formatKeywordEntries(entries, mode = 'TEXT') { return entries.join(mode === 'REGEX' ? '\n' : ', '); }
+function updateKeywordSearchHelp(mode, element = $('#keywordSearchHelp')) {
+  if (element) element.textContent = mode === 'REGEX'
+    ? 'Enter one case-insensitive Unicode regex per line. Malayalam text is supported; repeated groups and backreferences are disabled for scan safety.'
+    : 'Comma-separated text keywords. Malayalam and other Unicode scripts are supported.';
+}
+async function fillKeywords(source) {
+  let activeMode = source.keywordSearchMode || 'TEXT';
+  const box = $('#keywordEditor'); box.className = '';
+  box.innerHTML = `<div class="formgrid"><label>Include keywords<small> (one regex per line in regex mode)</small><textarea id="kwIncludes" rows="4">${escapeHtml(formatKeywordEntries(source.keywords || [], activeMode))}</textarea></label><label>Exclude keywords<small> (always take priority)</small><textarea id="kwExcludes" rows="4">${escapeHtml(formatKeywordEntries(source.excludeKeywords || [], activeMode))}</textarea></label><label>Keyword search<select id="kwSearchMode"><option value="TEXT" ${activeMode === 'TEXT' ? 'selected' : ''}>Text keywords</option><option value="REGEX" ${activeMode === 'REGEX' ? 'selected' : ''}>Regular expressions</option></select></label><p class="sub wide" id="kwSearchHelp"></p><label>Match mode<select id="kwMode"><option ${source.matchMode === 'ANY' ? 'selected' : ''}>ANY</option><option ${source.matchMode === 'ALL' ? 'selected' : ''}>ALL</option></select></label><div class="actions"><button class="button" id="clearKeywords">Delete all keywords</button><button class="button primary" id="saveKeywords">Save keyword rules</button></div></div>`;
+  updateKeywordSearchHelp(activeMode, $('#kwSearchHelp'));
+  $('#kwSearchMode').addEventListener('change', e => {
+    const newMode = e.target.value;
+    $('#kwIncludes').value = formatKeywordEntries(parseKeywordEntries($('#kwIncludes').value, activeMode), newMode);
+    $('#kwExcludes').value = formatKeywordEntries(parseKeywordEntries($('#kwExcludes').value, activeMode), newMode);
+    activeMode = newMode;
+    updateKeywordSearchHelp(newMode, $('#kwSearchHelp'));
+  });
+  $('#saveKeywords').onclick = async () => {
+    const selectedMode = $('#kwSearchMode').value;
+    await api(`/api/sources/${source._id}`, { method: 'PUT', body: JSON.stringify({ keywords: parseKeywordEntries($('#kwIncludes').value, selectedMode), excludeKeywords: parseKeywordEntries($('#kwExcludes').value, selectedMode), matchMode: $('#kwMode').value, keywordSearchMode: selectedMode }) });
+    toast('Keyword rules saved'); await render();
+  };
+  $('#clearKeywords').onclick = async () => {
+    await api(`/api/sources/${source._id}`, { method: 'PUT', body: JSON.stringify({ keywords: [], excludeKeywords: [] }) });
+    toast('All keywords cleared'); await render();
+  };
+}$('#nav').addEventListener('click', e => { const b = e.target.closest('[data-view]'); if (!b) return; state.view = b.dataset.view; state.page = 1; render().catch(err => toast(err.message, true)); });
 $('#themeToggle').addEventListener('click', () => applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'));
 applyTheme(document.documentElement.dataset.theme || 'dark', false);
 $('#content').addEventListener('click', async e => {
@@ -127,10 +327,14 @@ $('#content').addEventListener('click', async e => {
   const type = e.target.closest('[data-type]'); if (type) { state.sourceType = type.dataset.type; return render().catch(err => toast(err.message, true)); }
   const page = e.target.closest('[data-page]'); if (page) { state.page = Number(page.dataset.page); return render().catch(err => toast(err.message, true)); }
   if (e.target.id === 'addSource') return showSource();
+  if (e.target.id === 'backToSources') { state.view = 'sources'; return render().catch(err => toast(err.message, true)); }
+  if (e.target.id === 'refreshTrending') return renderTrending().catch(err => toast(err.message, true));
   if (e.target.id === 'bulkApprove') { const params = new URLSearchParams({ approvalStatus: 'PENDING', page: String(state.page), limit: String(state.limit) }); if (state.approvalChannelId) params.set('sourceId', state.approvalChannelId); const items = await api(`/api/queue?${params}`); if (!items.items.length) return toast('No pending approvals'); const result = await api('/api/queue/bulk-approve', { method: 'POST', body: JSON.stringify({ ids: items.items.map(x => x._id) }) }); toast(`Approved ${result.modified} videos`); return render(); }
   const btn = e.target.closest('[data-act]'); if (!btn) return;
   try {
     const id = btn.dataset.id;
+    if (btn.dataset.act === 'source-history') { state.sourceHistoryId = id; state.sourceDecision = ''; state.page = 1; state.view = 'source-history'; return render().catch(err => toast(err.message, true)); }
+    if (btn.dataset.act === 'adaptive-rankings') return await renderAdaptiveRankings(id);
     if (btn.dataset.act === 'approve' || btn.dataset.act === 'reject') { await api(`/api/queue/${id}/${btn.dataset.act}`, { method: 'POST' }); toast(`Video ${btn.dataset.act}d`); }
     if (btn.dataset.act === 'retry') { await api(`/api/queue/${id}/retry`, { method: 'POST' }); toast('Video returned to pending imports'); }
     if (btn.dataset.act === 'reset' && confirm('Reset this video and clear its retry count?')) { await api(`/api/queue/${id}/reset`, { method: 'POST' }); toast('Video reset for a fresh attempt'); }
@@ -138,26 +342,101 @@ $('#content').addEventListener('click', async e => {
     if (btn.dataset.act === 'toggle-gemini') { const sources = await api('/api/sources'); const s = sources.find(x => x._id === id); await api(`/api/sources/${id}`, { method: 'PUT', body: JSON.stringify({ thumbnailGeminiEnabled: !s.thumbnailGeminiEnabled }) }); toast(`Gemini thumbnail analysis ${s.thumbnailGeminiEnabled ? 'disabled' : 'enabled'}`); }
     if (btn.dataset.act === 'toggle-source') { const sources = await api('/api/sources'); const s = sources.find(x => x._id === id); await api(`/api/sources/${id}`, { method: 'PUT', body: JSON.stringify({ enabled: !s.enabled }) }); toast('Source updated'); }
     if (btn.dataset.act === 'delete-source' && confirm('Delete this source? Existing queue records and scan history will be preserved.')) { await api(`/api/sources/${id}`, { method: 'DELETE' }); toast('Source deleted'); }
-    if (btn.dataset.act === 'scan-source') { btn.disabled = true; btn.textContent = 'Scanning…'; const r = await api(`/api/scan/${id}`, { method: 'POST' }); toast(`Scan complete: ${r.matched} matches, ${r.errors} errors`); }
+    if (btn.dataset.act === 'scan-source') {
+      btn.disabled = true; btn.textContent = 'Scanning…';
+      const r = await api(`/api/scan/${id}`, { method: 'POST' });
+      const matched = r.matched ?? r.matches ?? r.result?.matched ?? r.result?.matches;
+      const errors = r.errors ?? r.errorCount ?? r.result?.errors ?? r.result?.errorCount;
+      const inspected = r.inspected ?? r.result?.inspected;
+      if (r.skipped) toast(`Scan skipped: ${r.reason || 'source was not scanned'}`);
+      else if (Number.isFinite(Number(matched)) && Number.isFinite(Number(errors))) {
+        toast(`Scan complete: ${matched} matches, ${errors} errors${Number.isFinite(Number(inspected)) ? ` (${inspected} inspected)` : ''}${r.mode === 'ADAPTIVE_TOP_10' ? ' · Adaptive Top 10' : r.mode === 'DAILY_TOP_VIDEOS' ? ` · Daily Top Videos${r.queued != null ? ` · ${r.queued} new queue entries` : ''}` : ''}`);
+      } else toast('Scan finished, but the server returned an unrecognized result. Check Scan History for details.', true);
+    }
     await render();
   } catch (err) { toast(err.message, true); }
 });
 $('#content').addEventListener('input', e => {
   if (e.target.id !== 'sourceSearch') return;
   state.sourceSearch = e.target.value;
-  const query = state.sourceSearch.trim().toLocaleLowerCase();
-  let visible = 0;
-  $('#content').querySelectorAll('.source-card').forEach(card => {
-    card.hidden = !card.dataset.sourceName.includes(query);
-    if (!card.hidden) visible++;
-  });
-  const empty = $('#sourceSearchEmpty');
-  if (empty) empty.hidden = visible > 0;
+  applySourceSearch();
+});
+$('#content').addEventListener('change', e => {
+  if (e.target.id !== 'sourceSearchRegex') return;
+  state.sourceSearchRegex = e.target.checked;
+  applySourceSearch();
 });
 $('#content').addEventListener('change', e => { if (!e.target.matches('[data-sort]')) return; state.sorts[state.view] = e.target.value; state.page = 1; render().catch(err => toast(err.message, true)); });
+$('#content').addEventListener('change', e => {
+  if (e.target.matches('[data-trending-filter]')) {
+    state.trendingFilters[e.target.dataset.trendingFilter] = e.target.value;
+    return renderTrending().catch(err => toast(err.message, true));
+  }
+  if (e.target.matches('[data-trending-sort]')) {
+    state.trendingFilters.sort = e.target.value;
+    return renderTrending().catch(err => toast(err.message, true));
+  }
+});
 $('#content').addEventListener('change', e => { if (e.target.id !== 'approvalChannelFilter') return; state.approvalChannelId = e.target.value; state.page = 1; render().catch(err => toast(err.message, true)); });
+$('#content').addEventListener('change', e => { if (e.target.id !== 'sourceDecisionFilter') return; state.sourceDecision = e.target.value; state.page = 1; renderSourceHistory().catch(err => toast(err.message, true)); });
 $('#content').addEventListener('change', async e => { if (e.target.id === 'keywordSource') { try { const sources = await api('/api/sources'); const source = sources.find(s => s._id === e.target.value); if (source) await fillKeywords(source); } catch (err) { toast(err.message, true); } } });
-$('#sourceForm').addEventListener('submit', async e => { e.preventDefault(); const f = e.currentTarget; const body = { name: f.elements.name.value.trim(), url: f.elements.url.value.trim(), type: f.elements.type.value, priority: f.elements.priority.value, matchMode: f.elements.matchMode.value, enabled: f.elements.enabled.checked, videosPerScan: Number(f.elements.videosPerScan.value), scanDescription: f.elements.scanDescription.checked || f.elements.generateNfo.checked, generateNfo: f.elements.generateNfo.checked, thumbnailGeminiEnabled: f.elements.thumbnailGeminiEnabled.checked, autoApproveVideos: f.elements.type.value === 'channel' && f.elements.autoApproveVideos.checked, keywords: splitWords(f.elements.keywords.value), excludeKeywords: splitWords(f.elements.excludeKeywords.value) }; try { const id = f.elements.id.value; await api(id ? `/api/sources/${id}` : '/api/sources', { method: id ? 'PUT' : 'POST', body: JSON.stringify(body) }); $('#sourceDialog').close(); toast(id ? 'Source updated' : 'Source added'); await render(); } catch (err) { toast(err.message, true); } });
+$('#sourceForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const f = e.currentTarget;
+  const id = f.elements.id.value;
+  let savedSourceId = id;
+  let imageUploadAttempted = false;
+  const images = [...f.elements.visualReferenceFile.files];
+  const wantsVisualMatch = f.elements.visualMatchEnabled.checked;
+  if (wantsVisualMatch && !images.length && f.dataset.hasVisualReference !== 'true') return toast('Choose a reference image before enabling visual matching', true);
+  const existingCount = Number(f.dataset.visualReferenceCount || '0');
+  if (existingCount + images.length > 10) return toast('A source can have up to 10 reference images', true);
+  const selectedBytes = images.reduce((sum, file) => sum + file.size, 0);
+  if (selectedBytes > 8 * 1024 * 1024) return toast('Selected reference images must total 8 MB or less', true);
+  const body = {
+    name: f.elements.name.value.trim(), url: f.elements.url.value.trim(), type: f.elements.type.value,
+    priority: f.elements.priority.value, matchMode: f.elements.matchMode.value, enabled: f.elements.enabled.checked,
+    adaptiveDiscoveryEnabled: f.elements.type.value === 'channel' && f.elements.adaptiveDiscoveryEnabled.checked,
+    trendingDiscoveryEnabled: f.elements.type.value === 'channel' && f.elements.trendingDiscoveryEnabled.checked,
+    dailyTopVideosEnabled: f.elements.type.value === 'channel' && f.elements.dailyTopVideosEnabled.checked,
+    dailyTopVideosCount: Number(f.elements.dailyTopVideosCount.value),
+    adaptiveContentType: f.elements.adaptiveContentType.value,
+    videosPerScan: Number(f.elements.videosPerScan.value), scanDescription: f.elements.scanDescription.checked || f.elements.generateNfo.checked,
+    generateNfo: f.elements.generateNfo.checked, thumbnailGeminiEnabled: f.elements.thumbnailGeminiEnabled.checked,
+    visualMatchEnabled: wantsVisualMatch && !images.length, visualMatchAutoApprove: f.elements.visualMatchAutoApprove.checked,
+    visualMatchAction: f.elements.visualMatchAction.value,
+    keywordSearchMode: f.elements.keywordSearchMode.value,
+    autoApproveVideos: f.elements.type.value === 'channel' && f.elements.autoApproveVideos.checked,
+    keywords: parseKeywordEntries(f.elements.keywords.value, f.elements.keywordSearchMode.value),
+    excludeKeywords: parseKeywordEntries(f.elements.excludeKeywords.value, f.elements.keywordSearchMode.value)
+  };
+  try {
+    const saved = await api(id ? `/api/sources/${id}` : '/api/sources', { method: id ? 'PUT' : 'POST', body: JSON.stringify(body) });
+    const sourceId = id || saved._id;
+    savedSourceId = sourceId;
+    if (images.length) {
+      let result;
+      for (let index = 0; index < images.length; index++) {
+        const image = images[index];
+        $('#visualReferenceStatus').textContent = `Uploading reference image ${index + 1} of ${images.length}…`;
+        imageUploadAttempted = true;
+        const response = await fetch(`/api/sources/${sourceId}/visual-reference`, { method: 'PUT', headers: { 'Content-Type': image.type }, body: image });
+        try { result = await response.json(); } catch { result = {}; }
+        if (!response.ok) throw new Error(result.error || `Image upload failed (${response.status})`);
+        f.dataset.savedVisualReferences = JSON.stringify(result.visualReferences || []);
+        f.dataset.visualReferenceCount = String(result.visualReferences?.length || 0);
+        f.dataset.hasVisualReference = String(Boolean(result.visualReferences?.length));
+      }
+      if (wantsVisualMatch) await api(`/api/sources/${sourceId}`, { method: 'PUT', body: JSON.stringify({ visualMatchEnabled: true }) });
+    }
+    $('#sourceDialog').close(); toast(id ? 'Source updated' : 'Source added'); await render();
+  } catch (err) {
+    if (imageUploadAttempted && savedSourceId) {
+      try { const sources = await api('/api/sources'); const savedSource = sources.find(source => source._id === savedSourceId); if (savedSource) showSource(savedSource); } catch {}
+    }
+    toast(err.message, true);
+  }
+});
 $('#content').addEventListener('submit', async e => {
   if (e.target.id !== 'scanSettingsForm') return;
   e.preventDefault();
