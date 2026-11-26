@@ -176,12 +176,18 @@ async function renderSourceHistory() {
   const [sources, scans] = await Promise.all([api('/api/sources'), api(`/api/scan-history/${encodeURIComponent(sourceId)}`)]);
   const source = sources.find(s => s._id === sourceId);
   const name = source?.name || scans[0]?.sourceName || 'Deleted source';
-  const qs = new URLSearchParams({ page: String(state.page), limit: String(state.limit), sort: 'discoveredAt', order: 'desc', sourceId });
-  if (state.sourceDecision) qs.set('approvalStatus', state.sourceDecision);
-  const videos = await api(`/api/queue?${qs}`);
+  const qs = new URLSearchParams({ page: String(state.page), limit: String(state.limit) });
+  if (state.sourceDecision) qs.set('outcome', state.sourceDecision);
+  const videos = await api(`/api/scan-history/${encodeURIComponent(sourceId)}/videos?${qs}`);
   const scansTable = scans.length ? `<div class="tablewrap"><table><thead><tr><th>Scan</th><th>Status</th><th>Inspected</th><th>Matched</th><th>Rejected</th><th>Errors</th></tr></thead><tbody>${scans.map(x => `<tr><td>${x.startedAt ? new Date(x.startedAt).toLocaleString() : '—'}</td><td>${badge(x.status)}</td><td>${x.inspected ?? 0}</td><td>${x.matched ?? 0}</td><td>${x.rejected ?? 0}</td><td>${x.errorCount ?? 0}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No scan records for this source.</div>';
-  const decision = `<label class="source-filter">Decision <select id="sourceDecisionFilter"><option value="">All decisions</option>${['APPROVED','REJECTED','PENDING'].map(v => `<option value="${v}" ${state.sourceDecision === v ? 'selected' : ''}>${v === 'PENDING' ? 'Pending review' : v}</option>`).join('')}</select></label>`;
-  $('#content').innerHTML = `${shell(`${escapeHtml(name)} history`, 'Scans and discovered videos with their current approval decisions', '<button class="button" id="backToSources">Back to sources</button>')}<h3 class="history-section-title">Scans</h3>${scansTable}<div class="panelhead source-history-videos"><div><h3>Scanned videos</h3><p>Approval status reflects the current decision</p></div>${decision}</div>${videoRows(videos.items, 'none')}${paging(videos)}</div>`;
+  const outcomes = [['','All outcomes'],['APPROVED','Approved'],['PENDING','Pending approval'],['REJECTED','Manually rejected'],['KEYWORD_REJECTED','Rejected by keywords'],['GEMINI_REJECTED','Rejected by Gemini'],['ERROR','Scan error'],['SKIPPED','Skipped'],['MATCHED','Matched videos']];
+  const decision = `<label class="source-filter">Outcome <select id="sourceDecisionFilter">${outcomes.map(([v,label]) => `<option value="${v}" ${state.sourceDecision === v ? 'selected' : ''}>${label}</option>`).join('')}</select></label>`;
+  const videoTable = videos.items.length ? `<div class="tablewrap"><table><thead><tr><th>Video</th><th>Outcome</th><th>Reason / matched keywords</th><th>Scanned</th></tr></thead><tbody>${videos.items.map(item => {
+    const label = item.approvalStatus === 'APPROVED' ? 'APPROVED' : item.approvalStatus === 'REJECTED' ? 'MANUALLY REJECTED' : item.approvalStatus === 'PENDING' ? 'PENDING APPROVAL' : item.result;
+    const detail = item.rejectionReason || (item.matchedKeywords?.length ? `Matched: ${item.matchedKeywords.join(', ')}` : '—');
+    return `<tr><td><div class="videocell"><img class="thumb" src="${escapeHtml(item.thumbnail || '')}" onerror="this.style.visibility='hidden'" alt=""><div><a class="title" href="${escapeHtml(item.url || `https://www.youtube.com/watch?v=${item.youtubeId}`)}" target="_blank" rel="noopener">${escapeHtml(item.title || item.youtubeId)}</a><div class="sub">${escapeHtml(item.youtubeId)}</div></div></div></td><td>${badge(label)}</td><td class="historydetails">${escapeHtml(detail)}</td><td>${item.scannedAt ? new Date(item.scannedAt).toLocaleString() : '—'}</td></tr>`;
+  }).join('')}</tbody></table></div>` : '<div class="empty">No scanned videos match this outcome. Individual video history is recorded from scans made after this update.</div>';
+  $('#content').innerHTML = `${shell(`${escapeHtml(name)} history`, 'Every inspected video with approval and filtering outcomes', '<button class="button" id="backToSources">Back to sources</button>')}<h3 class="history-section-title">Scans</h3>${scansTable}<div class="panelhead source-history-videos"><div><h3>Scanned videos</h3><p>Includes approved, manually rejected, keyword-filtered, and Gemini-filtered videos</p></div>${decision}</div>${videoTable}${paging(videos)}</div>`;
 }
 async function render() {
   state.page = Math.max(1, state.page);

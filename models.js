@@ -82,6 +82,15 @@ const historySchema = new Schema({
 historySchema.index({ sourceId: 1, startedAt: -1 });
 historySchema.index({ startedAt: -1 });
 
+const scannedVideoHistorySchema = new Schema({
+  scanId: { type: Schema.Types.ObjectId, required: true }, sourceId: { type: Schema.Types.ObjectId, required: true },
+  youtubeId: { type: String, required: true }, title: { type: String, default: '' }, url: { type: String, default: '' }, thumbnail: { type: String, default: '' },
+  scannedAt: { type: Date, required: true }, result: { type: String, enum: ['MATCHED', 'KEYWORD_REJECTED', 'GEMINI_REJECTED', 'ERROR', 'SKIPPED'], required: true },
+  rejectionReason: { type: String, default: '' }, matchedKeywords: { type: [String], default: [] }
+}, { timestamps: true, collection: 'scanned_video_history' });
+scannedVideoHistorySchema.index({ sourceId: 1, scannedAt: -1 });
+scannedVideoHistorySchema.index({ scanId: 1, scannedAt: -1 });
+
 const scannerSettingsSchema = new Schema({
   _id: { type: String, default: 'global' },
   autoScanEnabled: { type: Boolean, default: true },
@@ -135,6 +144,7 @@ module.exports = {
   Source: mongoose.models.Source || mongoose.model('Source', sourceSchema, 'sources'),
   QueuedVideo: mongoose.models.QueuedVideo || mongoose.model('QueuedVideo', queueSchema, 'youtube_queue'),
   ScanHistory: mongoose.models.ScanHistory || mongoose.model('ScanHistory', historySchema, 'scan_history'),
+  ScannedVideoHistory: mongoose.models.ScannedVideoHistory || mongoose.model('ScannedVideoHistory', scannedVideoHistorySchema, 'scanned_video_history'),
   ScannerSettings: mongoose.models.ScannerSettings || mongoose.model('ScannerSettings', scannerSettingsSchema),
   AdaptiveVideo: mongoose.models.AdaptiveVideo || mongoose.model('AdaptiveVideo', adaptiveVideoSchema),
   ChannelProfile: mongoose.models.ChannelProfile || mongoose.model('ChannelProfile', channelProfileSchema),

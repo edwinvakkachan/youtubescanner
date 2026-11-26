@@ -3,7 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const { connectDB } = require('./db');
-const { Source, QueuedVideo, ScanHistory, ScannerSettings, AdaptiveVideo, ChannelProfile, ChannelRanking, VideoStatsHistory } = require('./models');
+const { Source, QueuedVideo, ScanHistory, ScannedVideoHistory, ScannerSettings, AdaptiveVideo, ChannelProfile, ChannelRanking, VideoStatsHistory } = require('./models');
 const scanner = require('./scanner');
 const scheduler = require('./scheduler');
 const logger = require('./logger');
@@ -264,8 +264,9 @@ app.delete('/api/sources/:id', async (req, res, next) => {
       } });
     }
 
-    const [history, adaptiveVideos, profile, rankings, stats] = await Promise.all([
+    const [history, scannedVideos, adaptiveVideos, profile, rankings, stats] = await Promise.all([
       ScanHistory.deleteMany({ sourceId }),
+      ScannedVideoHistory.deleteMany({ sourceId }),
       AdaptiveVideo.deleteMany({ sourceId }),
       ChannelProfile.deleteMany({ sourceId }),
       ChannelRanking.deleteMany({ sourceId }),
@@ -275,6 +276,7 @@ app.delete('/api/sources/:id', async (req, res, next) => {
     logger.info('source_and_related_data_deleted', {
       sourceId: req.params.id, sourceName: current.name, queueItems: queueItems.length,
       scanHistory: history.deletedCount, adaptiveVideos: adaptiveVideos.deletedCount,
+      scannedVideos: scannedVideos.deletedCount,
       channelProfiles: profile.deletedCount, channelRankings: rankings.deletedCount,
       videoStatsHistory: stats.deletedCount, referenceImages: fileIds.length
     });
@@ -332,6 +334,21 @@ app.post('/api/scan', async (_req, res, next) => { try { if (scanPromise) return
 app.post('/api/scan/:sourceId', async (req, res, next) => { try { objectId(req.params.sourceId); const result = await scanner.scanOne(req.params.sourceId); res.json(result); } catch (e) { next(e); } });
 app.get('/api/scan-history', async (req, res, next) => { try { const page = Math.max(1, Number.parseInt(req.query.page || '1', 10) || 1); const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit || '50', 10) || 50)); const sort = requestedSort(req, { startedAt: 'startedAt', sourceName: 'sourceName', matched: 'matched', errors: 'errorCount' }, { startedAt: -1 }); if (!sort) return res.status(400).json({ error: 'Invalid scan history sort or order' }); const [items, total] = await Promise.all([ScanHistory.find().sort(sort).skip((page - 1) * limit).limit(limit).lean(), ScanHistory.countDocuments()]); res.json({ items, total, page, limit }); } catch (e) { next(e); } });
 app.get('/api/scan-history/:sourceId', async (req, res, next) => { try { objectId(req.params.sourceId); res.json(await ScanHistory.find({ sourceId: req.params.sourceId }).sort({ startedAt: -1 }).limit(100).lean()); } catch (e) { next(e); } });
+app.get('/api/scan-history/:sourceId/videos', async (req, res, next) => { try {
+  objectId(req.params.sourceId);
+  const page = Math.max(1, Number.parseInt(req.query.page || '1', 10) || 1); const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit || '25', 10) || 25));
+  const filter = { sourceId: req.params.sourceId }; const outcome = String(req.query.outcome || '');
+  if (['KEYWORD_REJECTED', 'GEMINI_REJECTED', 'ERROR', 'SKIPPED', 'MATCHED'].includes(outcome)) filter.result = outcome;
+  else if (['APPROVED', 'PENDING', 'REJECTED'].includes(outcome)) {
+    const decisions = await QueuedVideo.find({ 'discoveredSources.sourceId': new mongoose.Types.ObjectId(req.params.sourceId), approvalStatus: outcome }).select('youtubeId').lean();
+    filter.result = 'MATCHED'; filter.youtubeId = { $in: decisions.map(item => item.youtubeId) };
+  } else if (outcome === 'FILTERED') filter.result = { $in: ['KEYWORD_REJECTED', 'GEMINI_REJECTED'] };
+  const [items, total] = await Promise.all([ScannedVideoHistory.find(filter).sort({ scannedAt: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).lean(), ScannedVideoHistory.countDocuments(filter)]);
+  const ids = items.map(item => item.youtubeId);
+  const queueItems = await QueuedVideo.find({ youtubeId: { $in: ids }, 'discoveredSources.sourceId': new mongoose.Types.ObjectId(req.params.sourceId) }).select('youtubeId approvalStatus status').lean();
+  const decisions = new Map(queueItems.map(item => [item.youtubeId, item]));
+  res.json({ items: items.map(item => ({ ...item, approvalStatus: decisions.get(item.youtubeId)?.approvalStatus || null, importStatus: decisions.get(item.youtubeId)?.status || null })), total, page, limit });
+} catch (e) { next(e); } });
 app.get('/api/settings/scan', async (_req, res, next) => {
   try {
     const settings = await scheduler.getSettings();
@@ -367,7 +384,7 @@ async function start() {
   logger.info('server_starting', { port: Number(process.env.PORT || 3000), logLevel: process.env.LOG_LEVEL || 'info' });
   await connectDB();
   logger.info('mongodb_connected');
-  await Promise.all([Source.init(), QueuedVideo.init(), ScanHistory.init(), ScannerSettings.init(), AdaptiveVideo.init(), ChannelProfile.init(), ChannelRanking.init(), VideoStatsHistory.init()]);
+  await Promise.all([Source.init(), QueuedVideo.init(), ScanHistory.init(), ScannedVideoHistory.init(), ScannerSettings.init(), AdaptiveVideo.init(), ChannelProfile.init(), ChannelRanking.init(), VideoStatsHistory.init()]);
   await scanner.migrateLegacyThumbnailSetting();
   logger.info('mongodb_indexes_ready', { collections: ['sources', 'youtube_queue', 'scan_history', 'scanner_settings'] });
   const approvalHoldback = await QueuedVideo.updateMany({ status: 'PENDING', approvalStatus: { $ne: 'APPROVED' } }, { $set: { status: 'AWAITING_APPROVAL' } });
