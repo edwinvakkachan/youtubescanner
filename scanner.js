@@ -196,7 +196,7 @@ async function thumbnailTextFromUrl(url, visualReferences = []) {
   if (!Array.isArray(analysis.matched_reference_indices) || typeof analysis.thumbnail_text !== 'string' || analysis.matched_reference_indices.some(index => !Number.isInteger(index) || index < 0 || index >= visualReferences.length)) throw new Error('Gemini returned an invalid visual match result');
   return { text: analysis.thumbnail_text, visualMatchIndices: [...new Set(analysis.matched_reference_indices)] };
 }
-async function scanNewGeminiThumbnails(source, entries, { bypassCursor = false, queueAccepted = true } = {}) {
+async function scanNewGeminiThumbnails(source, entries, { bypassCursor = false, queueAccepted = true, updateCursor = true } = {}) {
   const results = new Map();
   let visualReferences = [];
   if (source.visualMatchEnabled) {
@@ -287,8 +287,10 @@ async function scanNewGeminiThumbnails(source, entries, { bypassCursor = false, 
       if (visualMatch) matches.push('visual-reference-match');
       const match = { accepted, matches, excluded: keywordMatch.excluded };
       if (match.accepted && queueAccepted) await upsertVideo(source, entry, match.matches);
-      await Source.updateOne({ _id: source._id }, { $set: { geminiLastScannedVideoId: id } });
-      source.geminiLastScannedVideoId = id;
+      if (updateCursor) {
+        await Source.updateOne({ _id: source._id }, { $set: { geminiLastScannedVideoId: id } });
+        source.geminiLastScannedVideoId = id;
+      }
       const rejectionType = keywordMatch.accepted ? 'GEMINI_REJECTED' : 'KEYWORD_REJECTED';
       const rejectionReason = match.accepted ? '' : keywordMatch.accepted
         ? (source.visualMatchEnabled ? `Gemini visual check rejected video (${action.toLowerCase()} matching references)` : 'Rejected by Gemini thumbnail analysis')
@@ -300,11 +302,51 @@ async function scanNewGeminiThumbnails(source, entries, { bypassCursor = false, 
       results.set(id, { accepted: false, matches: [], rejectionType: 'ERROR', rejectionReason: err.message, error: true });
       logger.gemini('ERROR', { model: 'gemini-3.1-flash-lite', sourceId: String(source._id), sourceName: source.name, youtubeId: id, title: String(entry.title || '').slice(0, 180), message: err.message });
       // Don't let one unsupported/corrupt thumbnail block all later videos.
-      await Source.updateOne({ _id: source._id }, { $set: { geminiLastScannedVideoId: id } });
-      source.geminiLastScannedVideoId = id;
+      await Source.updateOne({ _id: source._id }, { $addToSet: { geminiPendingVideos: {
+        youtubeId: id, title: entry.title || '', description: entry.description || '', thumbnail,
+        upload_date: entry.upload_date || '', release_date: entry.release_date || '',
+        duration: Number.isFinite(entry.duration) ? entry.duration : undefined,
+        url: entry.url || '', webpage_url: entry.webpage_url || ''
+      } } });
+      if (updateCursor) {
+        await Source.updateOne({ _id: source._id }, { $set: { geminiLastScannedVideoId: id } });
+        source.geminiLastScannedVideoId = id;
+      }
     }
   }
   return { results, skippedIds, attempted, error };
+}
+async function processPendingGemini(source) {
+  if (!(source.thumbnailGeminiEnabled === true || source.visualMatchEnabled === true)) return { processed: 0, failed: 0 };
+  const freshSource = await Source.findById(source._id).lean();
+  if (!freshSource) return { processed: 0, failed: 0 };
+  source = freshSource;
+  const pending = source.geminiPendingVideos || [];
+  if (!pending.length) return { processed: 0, failed: 0 };
+  const sourceKey = String(source._id);
+  if (activeSources.has(sourceKey)) return { processed: 0, failed: pending.length, skipped: true };
+  activeSources.add(sourceKey);
+  const startedAt = new Date();
+  const history = await ScanHistory.create({ sourceId: source._id, sourceName: source.name, sourceType: source.type, startedAt });
+  try {
+    logger.info('gemini_pending_pass_started', { sourceId: sourceKey, sourceName: source.name, pendingVideos: pending.length });
+    const result = await scanNewGeminiThumbnails(source, pending, { bypassCursor: true, updateCursor: false });
+    const scannedVideos = [];
+    let matched = 0; let rejected = 0; let processed = 0;
+    for (const entry of pending) {
+      const id = videoId(entry); const item = result.results.get(id);
+      if (!item || item.error) continue;
+      processed++;
+      if (item.accepted) matched++; else rejected++;
+      await Source.updateOne({ _id: source._id }, { $pull: { geminiPendingVideos: { youtubeId: id } } });
+      scannedVideos.push({ scanId: history._id, sourceId: source._id, youtubeId: id, title: entry.title || '', url: videoUrl(entry, id), thumbnail: entry.thumbnail || '', scannedAt: new Date(), result: item.accepted ? 'MATCHED' : item.rejectionType || 'GEMINI_REJECTED', rejectionReason: item.rejectionReason || '', matchedKeywords: item.matches || [] });
+    }
+    if (scannedVideos.length) await ScannedVideoHistory.insertMany(scannedVideos, { ordered: false });
+    const completedAt = new Date();
+    await ScanHistory.updateOne({ _id: history._id }, { $set: { completedAt, inspected: pending.length, matched, rejected, errorCount: result.error ? 1 : 0, errorDetails: result.error ? [`Gemini: ${result.error.message}`] : [], status: result.error ? 'PARTIAL' : 'COMPLETED' } });
+    logger.info('gemini_pending_pass_completed', { sourceId: sourceKey, sourceName: source.name, attempted: result.attempted, processed, remaining: pending.length - processed, errors: result.error ? 1 : 0 });
+    return { processed, failed: pending.length - processed };
+  } finally { activeSources.delete(sourceKey); }
 }
 function xmlEscape(value) {
   return String(value ?? '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '')
@@ -708,7 +750,12 @@ async function scanAll() {
     ] }).sort({ createdAt: 1 }).lean();
     logger.info('full_scan_started', { enabledSources: sources.length, defaultMaxEntriesPerSource: LIMIT, perSourceLimitsEnabled: true, adaptiveDailyFrequency: true });
     const results = [];
-    for (const source of sources) results.push(await scanSource(source));
+    for (const source of sources) await processPendingGemini(source);
+    for (const source of sources) {
+      results.push(await scanSource(source));
+      // Retry quota-limited Gemini videos before the next source starts.
+      await processPendingGemini(source);
+    }
     logger.info('full_scan_completed', { sourceCount: results.length, scanned: results.filter(item => !item.skipped).length, skipped: results.filter(item => item.skipped).length });
     return results;
   } finally { activeAll = false; }
@@ -718,13 +765,14 @@ async function scanOne(id) {
   const source = await Source.findById(id).lean();
   if (!source) { const err = new Error('Source not found'); err.status = 404; throw err; }
   if (!source.enabled) { const err = new Error('Source is disabled'); err.status = 409; throw err; }
+  await processPendingGemini(source);
   return scanSource(source, { forceAdaptive: true });
 }
 async function migrateLegacyThumbnailSetting() {
   await Source.collection.updateMany({ thumbnailOcrEnabled: true }, { $set: { thumbnailGeminiEnabled: true }, $unset: { thumbnailOcrEnabled: 1 } });
   await Source.collection.updateMany({ thumbnailOcrEnabled: { $exists: true } }, { $unset: { thumbnailOcrEnabled: 1 } });
 }
-module.exports = { scanAll, scanOne, runYtDlp, findMatches, migrateLegacyThumbnailSetting, LIMIT };
+module.exports = { scanAll, scanOne, runYtDlp, findMatches, migrateLegacyThumbnailSetting, processPendingGemini, LIMIT };
 if (require.main === module) {
   require('dotenv').config();
   const { connectDB } = require('./db');

@@ -23,6 +23,7 @@ const sourceSchema = new Schema({
   scanDescription: { type: Boolean, default: true },
   thumbnailGeminiEnabled: { type: Boolean, default: false },
   geminiLastScannedVideoId: { type: String, default: '' },
+  geminiPendingVideos: { type: [{ youtubeId: String, title: String, description: String, thumbnail: String, upload_date: String, release_date: String, duration: Number, url: String, webpage_url: String }], default: [] },
   visualMatchEnabled: { type: Boolean, default: false },
   visualMatchAutoApprove: { type: Boolean, default: true },
   visualMatchAction: { type: String, enum: ['ACCEPT', 'REJECT'], default: 'ACCEPT' },
