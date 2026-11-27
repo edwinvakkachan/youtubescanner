@@ -21,13 +21,15 @@ const keywordRegexCache = new WeakMap();
 let activeAll = false;
 const activeSources = new Set();
 
-function runYtDlp(source, limit) {
+function runYtDlp(source, limit, stopAfterVideoId = '') {
   return new Promise((resolve, reject) => {
     const executable = process.env.YT_DLP_PATH || 'yt-dlp';
-    const args = ['--dump-json', '--playlist-end', String(limit), '--retries', '3', '--extractor-retries', '3', '--socket-timeout', '30', '--ignore-errors', '--no-warnings', '--skip-download', source.url];
+    const args = ['--dump-json', '--lazy-playlist'];
+    if (!stopAfterVideoId) args.push('--playlist-end', String(limit));
+    args.push('--retries', '3', '--extractor-retries', '3', '--socket-timeout', '30', '--ignore-errors', '--no-warnings', '--skip-download', source.url);
     const child = spawn(executable, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     const entries = [];
-    let stderr = ''; let settled = false; let parseErrors = 0; let timedOut = false;
+    let stderr = ''; let settled = false; let parseErrors = 0; let timedOut = false; let cursorIndex = -1;
     const timeout = setTimeout(() => { timedOut = true; logger.warn('ytdlp_process_timeout', { sourceId: String(source._id), sourceName: source.name, timeoutMinutes: YT_DLP_TIMEOUT_MINUTES, metadataEntriesReceived: entries.length }); child.kill(); }, YT_DLP_TIMEOUT_MS);
     const heartbeat = setInterval(() => logger.info('ytdlp_process_still_running', { sourceId: String(source._id), sourceName: source.name, elapsedSeconds: Math.floor((Date.now() - startedAt) / 1000), metadataEntriesReceived: entries.length, targetEntries: limit }), 30000);
     const startedAt = Date.now();
@@ -39,6 +41,8 @@ function runYtDlp(source, limit) {
         const entry = JSON.parse(line);
         entries.push(entry);
         logger.info('ytdlp_video_metadata_received', { sourceId: String(source._id), sourceName: source.name, videoNumber: entries.length, videoId: entry.id || null, title: String(entry.title || '').slice(0, 180), uploadDate: entry.upload_date || null, durationSeconds: entry.duration ?? null });
+        if (stopAfterVideoId && cursorIndex < 0 && videoId(entry) === stopAfterVideoId) cursorIndex = entries.length - 1;
+        if (stopAfterVideoId && ((cursorIndex >= 0 && entries.length - cursorIndex - 1 >= limit) || entries.length >= 10000)) child.kill();
       } catch (err) {
         parseErrors++;
         logger.warn('ytdlp_metadata_line_invalid', { sourceId: String(source._id), sourceName: source.name, message: err.message });
@@ -609,7 +613,7 @@ async function scanSource(source, { forceAdaptive = false } = {}) {
     }
     // Fetch enough of the feed to find the saved boundary. yt-dlp returns channel
     // uploads newest first, so continuing after the cursor walks toward older uploads.
-    const feed = await runYtDlp(source, source.scanCursorVideoId ? 10000 : limit);
+    const feed = await runYtDlp(source, limit, source.scanCursorVideoId || '');
     const cursorIndex = source.scanCursorVideoId ? feed.findIndex(entry => videoId(entry) === source.scanCursorVideoId) : -1;
     let entries;
     if (cursorIndex >= 0) {
